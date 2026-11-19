@@ -105,6 +105,9 @@ write_bridge_state() {
   mv -f "$tmp" "$BRIDGE_DIR/state.json"
 }
 write_bridge_state starting
+# A reload request recorded before this start (by the forwarder, for the bridge of an earlier run) is never acted on.
+RELOAD_REQUEST="$BRIDGE_DIR/reload-request"
+rm -f "$RELOAD_REQUEST"
 
 # Edit proxy and preview forwarder on PORT. It is the tenant boundary: every
 # request needs its own session (docs/block.md). It forwards to
@@ -115,6 +118,8 @@ write_bridge_state starting
 LIB_DIR="${LIIVO_LIB_DIR:-/usr/local/lib/liivo}"
 FORWARDER="$LIB_DIR/preview-forwarder.js"
 FETCHER="$LIB_DIR/bridge-fetch.js"
+# The default start for a repository without .liivo/start.sh (see run_hooks).
+DEFAULT_START="$LIB_DIR/default-start.js"
 forwarder_started=""
 # The orchestrator does not set PORT: the instance's container port is fixed at 8080.
 PORT="${PORT:-8080}"
@@ -154,14 +159,36 @@ unset handoff_key
 # CODER_AGENT_*) or of the other secrets. A gateway failure backs off 5, 10, 20, 40, then 60 s; the
 # bridge restarts after 1 to 30 s. The tenant's project code runs as the same uid and can reach the
 # bridge's files and loopback port; docs/block.md says so.
+# Reload (POST /__liivo/bridge/reload, recorded by the forwarder as $RELOAD_REQUEST, only its existence is read):
+# while the bridge runs the supervisor polls once a second, reads the bridge's loopback /health itself and stops
+# the bridge it started (SIGTERM, never a pid from a file) only on a 200 answer with boolean busy=false. Any other
+# answer keeps the request; a request older than RELOAD_MAX_AGE seconds is deleted without acting. A stop for a
+# reload is not a crash (run_delay untouched) and the fetcher runs again so the gateway's current version starts.
+RELOAD_MAX_AGE=300
+bridge_idle() {
+  local body
+  # No answer (curl fails, or says nothing) is never idle. jq -e alone would exit 0 on empty input.
+  body="$(curl -fsS -m 2 "http://127.0.0.1:$BRIDGE_PORT/health" 2> /dev/null)" || return 1
+  [ -n "$body" ] || return 1
+  printf '%s' "$body" | jq -e '(.busy | type) == "boolean" and .busy == false' > /dev/null 2>&1
+}
+reload_expired() {
+  local mtime
+  mtime="$(stat -c %Y "$RELOAD_REQUEST" 2> /dev/null)" || return 1
+  [ $(($(date +%s) - mtime)) -gt "$RELOAD_MAX_AGE" ]
+}
 supervise_bridge() {
-  local gw_delay=5 run_delay=1 rc version started bpid
+  local gw_delay=5 run_delay=1 rc version started bpid reloaded
   local -a bridge_env
+  # A fifo nothing writes to: `read -t 1` on it is a one second wait that is not a `sleep` call.
+  mkfifo "$BRIDGE_DIR/.tick" && exec 9<> "$BRIDGE_DIR/.tick" && rm -f "$BRIDGE_DIR/.tick"
   while true; do
     rc=0
     # env -i: the fetcher needs only PATH (node, tar) and HOME (the signer socket and the cache); it gets
     # none of the agent's or the Claude credential's variables.
     version="$(env -i PATH="$PATH" HOME="$HOME" LANG="${LANG:-C.UTF-8}" node "$FETCHER")" || rc=$?
+    # A request recorded while the fetch ran is satisfied by it.
+    rm -f "$RELOAD_REQUEST"
     case "$version" in
       '' | *[!A-Za-z0-9._-]*) [ "$rc" -ne 0 ] || rc=3 ;;
     esac
@@ -183,7 +210,7 @@ supervise_bridge() {
       LIIVO_REPO_DIR="$PROJECT_DIR" LIIVO_PREVIEW_PORT="$PREVIEW_PORT"
       LIIVO_GATEWAY_URL="${LIIVO_GATEWAY_URL:-}" LIIVO_INSTANCE="$LIIVO_INSTANCE"
       OSC_HOSTNAME="${OSC_HOSTNAME:-}" LIIVO_PREVIEW_URL="${LIIVO_EDIT_URL:-}"
-      LIIVO_BRIDGE_PORT="$BRIDGE_PORT" DISABLE_UPDATES=1 DISABLE_AUTOUPDATER=1)
+      LIIVO_BRIDGE_PORT="$BRIDGE_PORT" LIIVO_DEFAULT_START="$DEFAULT_START" DISABLE_UPDATES=1 DISABLE_AUTOUPDATER=1)
     [ -z "${CLAUDE_CODE_OAUTH_TOKEN:-}" ] || bridge_env+=(CLAUDE_CODE_OAUTH_TOKEN="$CLAUDE_CODE_OAUTH_TOKEN")
     [ -z "${ANTHROPIC_API_KEY:-}" ] || bridge_env+=(ANTHROPIC_API_KEY="$ANTHROPIC_API_KEY")
     while true; do
@@ -193,13 +220,36 @@ supervise_bridge() {
       write_bridge_state running "$version"
       printf '{"version":"%s","pid":%s,"startedAt":"%s"}\n' "$version" "$bpid" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$BRIDGE_DIR/running.json"
       rc=0
+      reloaded=""
+      while kill -0 "$bpid" 2> /dev/null; do
+        if [ -e "$RELOAD_REQUEST" ]; then
+          if reload_expired; then
+            rm -f "$RELOAD_REQUEST"
+            log "bridge reload request expired without an idle bridge, deleted"
+          elif bridge_idle; then
+            kill -TERM "$bpid" 2> /dev/null && reloaded=1
+            rm -f "$RELOAD_REQUEST"
+            break
+          fi
+        fi
+        read -r -t 1 -u 9 _ || true
+      done
       wait "$bpid" || rc=$?
       write_bridge_state starting "$version"
+      if [ -n "$reloaded" ]; then
+        log "bridge stopped for a reload ($rc), fetching the current bridge"
+        break
+      fi
       [ $(($(date +%s) - started)) -lt 60 ] || run_delay=1
       log "bridge exited ($rc), restarting in ${run_delay}s"
       sleep "$run_delay"
       run_delay=$((run_delay * 2))
       [ "$run_delay" -le 30 ] || run_delay=30
+      if [ -e "$RELOAD_REQUEST" ]; then
+        rm -f "$RELOAD_REQUEST"
+        log "bridge reload requested while the bridge was down, fetching the current bridge"
+        break
+      fi
     done
   done
 }
@@ -225,16 +275,27 @@ mask_url() { echo "$1" | sed -E 's#^([a-zA-Z][a-zA-Z0-9+.-]*://)[^/]*@#\1***@#';
 CLONE_LOG="$HOME/liivo-clone.log"
 clone_retry=""
 
-# Why a clone attempt failed, in a few words, read from its log (the log never holds a credential:
-# git does not print one and the helper prints only its cause).
+# Every git clone attempt, the foreground first one and each retry, runs under a wall-clock limit
+# (LIIVO_CLONE_TIMEOUT, 120 s). A git that ignores SIGTERM is killed by SIGKILL after the grace
+# (LIIVO_CLONE_KILL_GRACE, 10 s), so no attempt can hold the entrypoint without end.
+CLONE_TIMEOUT="${LIIVO_CLONE_TIMEOUT:-120}"
+CLONE_KILL_GRACE="${LIIVO_CLONE_KILL_GRACE:-10}"
+
+# Why the latest clone attempt failed, in a few words, read from that attempt's own part of the log:
+# the text after the last "=== attempt" line, never an earlier attempt's output (the log never holds a
+# credential: git does not print one and the helper prints only its cause).
 clone_cause() {
-  if grep -qi 'tenant not known' "$CLONE_LOG" 2>/dev/null; then
+  local text
+  text="$(awk '/^=== attempt /{buf=""; next} {buf = buf $0 "\n"} END{printf "%s", buf}' "$CLONE_LOG" 2> /dev/null)"
+  if printf '%s' "$text" | grep -q 'liivo-clone: timed out after'; then
+    printf '%s' "$text" | grep -o 'timed out after [0-9]*s' | tail -n1
+  elif printf '%s' "$text" | grep -qi 'tenant not known'; then
     echo "the edit proxy does not know its tenant yet"
-  elif grep -qiE 'could not read (Username|Password)|authentication failed|no credentials|terminal prompts disabled' "$CLONE_LOG" 2>/dev/null; then
+  elif printf '%s' "$text" | grep -qiE 'could not read (Username|Password)|authentication failed|no credentials|terminal prompts disabled'; then
     echo "authentication failed"
-  elif grep -qiE 'not found|does not appear to be a git repository' "$CLONE_LOG" 2>/dev/null; then
+  elif printf '%s' "$text" | grep -qiE 'not found|does not appear to be a git repository'; then
     echo "repository not found"
-  elif grep -qiE 'invalid|unable to find remote helper|protocol' "$CLONE_LOG" 2>/dev/null; then
+  elif printf '%s' "$text" | grep -qiE 'invalid|unable to find remote helper|protocol'; then
     echo "invalid repository URL"
   else
     echo "see $CLONE_LOG"
@@ -243,17 +304,30 @@ clone_cause() {
 
 # One clone attempt; appends to the clone log with the time. Returns git's status. A failed attempt
 # removes only what it created: the directory when it did not exist before, otherwise what the attempt
-# put into the empty directory it found.
+# put into the empty directory it found. An attempt that git ended by the time limit or by a signal
+# (status 124, or above 128) owns whatever it left, a partial .git included. An attempt that exited by
+# itself with .git/HEAD present leaves the directory alone: that can be a checkout made by hand.
 clone_attempt() {
-  local n="$1" existed="" rc=0
+  local n="$1" existed="" rc=0 t0 elapsed_us killed=""
   [ ! -d "$PROJECT_DIR" ] || existed=1
   printf '=== attempt %s at %s\n' "$n" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$CLONE_LOG"
-  git clone -- "$REPO_URL" "$PROJECT_DIR" >> "$CLONE_LOG" 2>&1 || rc=$?
+  t0="${EPOCHREALTIME/./}"
+  timeout -k "$CLONE_KILL_GRACE" "$CLONE_TIMEOUT" git clone -- "$REPO_URL" "$PROJECT_DIR" >> "$CLONE_LOG" 2>&1 || rc=$?
   if [ "$rc" -ne 0 ]; then
+    elapsed_us=$((${EPOCHREALTIME/./} - t0))
+    # timeout exits 124 on the limit and 137 when it needed SIGKILL; a git that killed itself also gives
+    # 137, so that status counts as the limit only when the attempt ran for the whole limit.
+    if [ "$rc" -eq 124 ] || { [ "$rc" -eq 137 ] && [ "$elapsed_us" -ge $((CLONE_TIMEOUT * 1000000)) ]; }; then
+      printf 'liivo-clone: timed out after %ss, git was stopped\n' "$CLONE_TIMEOUT" >> "$CLONE_LOG"
+    fi
+    if [ "$rc" -eq 124 ] || [ "$rc" -gt 128 ]; then killed=1; fi
     if [ -z "$existed" ]; then
       rm -rf "$PROJECT_DIR"
-    elif [ -d "$PROJECT_DIR" ] && [ ! -e "$PROJECT_DIR/.git/HEAD" ]; then
-      find "$PROJECT_DIR" -mindepth 1 -delete 2>/dev/null || true
+    elif [ -d "$PROJECT_DIR" ] && { [ -n "$killed" ] || [ ! -e "$PROJECT_DIR/.git/HEAD" ]; }; then
+      if [ -n "$killed" ] && [ -n "$(ls -A "$PROJECT_DIR" 2> /dev/null)" ]; then
+        printf 'liivo-clone: removed the partial checkout the stopped attempt left in %s\n' "$PROJECT_DIR" >> "$CLONE_LOG"
+      fi
+      find "$PROJECT_DIR" -mindepth 1 -delete 2> /dev/null || true
     fi
     return "$rc"
   fi
@@ -360,6 +434,20 @@ run_hooks() {
       bash -c 'printf "%s" "$$" > "$1"; shift; exec "$@"' _ "$start_pid_file" bash .liivo/start.sh \
         || echo "start.sh exited with an error"
     fi
+  elif [ -f "$DEFAULT_START" ]; then
+    # No own start.sh: the default start derives install and start from package.json and the lockfile
+    # (docs/block.md). Same wrapper and pid file as an own start.sh, so the bridge's restart contract holds
+    # from the first moment; its output goes to /tmp/liivo-start-<dir>.log, the file the bridge appends to.
+    start_name="liivo-start-$(basename "$PROJECT_DIR")"
+    echo "running the default start, output in /tmp/$start_name.log"
+    # shellcheck disable=SC2016 # $$ and $1 are for the inner bash, not this one
+    if command -v setsid >/dev/null 2>&1; then
+      setsid --wait bash -c 'printf "%s" "$$" > "$1"; shift; exec "$@"' _ "/tmp/$start_name.pid" node "$DEFAULT_START" \
+        >> "/tmp/$start_name.log" 2>&1 || echo "the default start ended with an error"
+    else
+      bash -c 'printf "%s" "$$" > "$1"; shift; exec "$@"' _ "/tmp/$start_name.pid" node "$DEFAULT_START" \
+        >> "/tmp/$start_name.log" 2>&1 || echo "the default start ended with an error"
+    fi
   fi
 }
 start_hooks() {
@@ -372,6 +460,8 @@ start_hooks() {
     run_hooks
   ) < /dev/null > "$HOME/liivo-run.log" 2>&1
 }
+# A state left in /tmp by an earlier run of the default start is never shown.
+rm -f "/tmp/liivo-start-$(basename "$PROJECT_DIR").state"
 if [ -n "$clone_retry" ]; then
   # The first clone failed: the hooks wait for the retries (until the clone works or the budget is
   # spent), so a hook never runs against an empty directory. The agent below does not wait.

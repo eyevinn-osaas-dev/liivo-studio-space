@@ -16,11 +16,13 @@ const path = require('node:path');
 const auth = require('./auth.js');
 const { workspaceStatus } = require('./workspace-status.js');
 const inject = require('./inject.js');
+const { defaultStartStatus } = require('./default-start-status.js');
 
 const RESERVED_PREFIX = '/__liivo/';
 const OPEN_PATH = '/__liivo/open';
 const STATUS_PATH = '/__liivo/status';
-const HANDOFF_PARAM = '__liivo';
+const RELOAD_PATH = '/__liivo/bridge/reload';
+const HANDOFF_PARAM ='__liivo';
 const DEFAULT_BRIDGE_PORT = 4777;
 // What of the /__liivo/ namespace the bridge may serve: a plain path of letters, digits, dots, dashes and
 // underscores, no dot segment, and not the proxy's own (`open`, `status`) or the reserved `bridge/`.
@@ -40,9 +42,15 @@ const PAGE_401 =
   '<!doctype html><html><head><meta charset="utf-8"><title>Sign in required</title></head>' +
   '<body><h1>Sign in required</h1><p>Open this project from Liivo Studio.</p></body></html>\n';
 
-const PAGE_502 =
-  '<!doctype html><html><head><meta charset="utf-8"><title>Preview not running</title></head>' +
-  `<body><h1>Preview not running</h1><p>The project's preview is not running.</p>${inject.tagFor('')}</body></html>\n`;
+// The page for a preview that does not answer. With a status of the default start (default-start.js) it adds one
+// status line and, while the default start is installing or starting, reloads itself.
+function page502(status = null) {
+  const refresh = status && status.refresh ? '<meta http-equiv="refresh" content="4">' : '';
+  return (
+    `<!doctype html><html><head><meta charset="utf-8">${refresh}<title>Preview not running</title></head>` +
+    `<body><h1>Preview not running</h1><p>The project's preview is not running.</p>${status ? status.html : ''}${inject.tagFor('')}</body></html>\n`
+  );
+}
 
 // Normalised path of a request target, for the /__liivo/ checks only (the
 // forwarded target is never rewritten). Handles absolute-form targets
@@ -169,9 +177,15 @@ function createForwarder({
   gatewayUrl = '',
   instance = '',
   projectDir = '',
+  // Where default-start.js writes its state file (/tmp in the workspace; a test points it elsewhere).
+  startStateDir = '/tmp',
   identityFile = '',
   bridgePort = DEFAULT_BRIDGE_PORT,
   bridgeStateFile = '',
+  // Existence-only request file the supervisor (osc-entrypoint.sh) polls; next to state.json unless given.
+  reloadRequestFile = bridgeStateFile ? path.join(path.dirname(bridgeStateFile), 'reload-request') : '',
+  // Deadline of the loopback /health read, below the gateway's 5 s abort of its reload call.
+  idleReadTimeoutMs = 2000,
   injectMaxBytes = 8 * 1024 * 1024,
   injectTimeoutMs = 10000,
   now = () => Math.floor(Date.now() / 1000),
@@ -275,6 +289,84 @@ function createForwarder({
     }
   }
 
+  // One GET of the bridge's loopback /health. Resolves true only for a 200 JSON answer with boolean busy === false,
+  // false for busy === true, and null for every other outcome (no answer, timeout, non-200, malformed body).
+  function readIdle() {
+    return new Promise((resolve) => {
+      let done = false;
+      const finish = (v) => {
+        if (!done) {
+          done = true;
+          resolve(v);
+        }
+      };
+      const r = http.get({ host: '127.0.0.1', port: bridgePort, path: '/health', agent: false, timeout: idleReadTimeoutMs }, (hr) => {
+        const chunks = [];
+        let size = 0;
+        hr.on('data', (c) => {
+          size += c.length;
+          if (size > 65536) {
+            hr.destroy();
+            finish(null);
+          } else chunks.push(c);
+        });
+        hr.on('error', () => finish(null));
+        hr.on('end', () => {
+          if (hr.statusCode !== 200) return finish(null);
+          try {
+            const b = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+            finish(b && typeof b.busy === 'boolean' ? !b.busy : null);
+          } catch {
+            finish(null);
+          }
+        });
+      });
+      r.on('timeout', () => {
+        r.destroy();
+        finish(null);
+      });
+      r.on('error', () => finish(null));
+    });
+  }
+
+  // Records a request for the supervisor, atomically (tmp file, then rename). False when it cannot be written.
+  function recordReload() {
+    if (!reloadRequestFile) return false;
+    const tmp = `${reloadRequestFile}.${process.pid}.tmp`;
+    try {
+      fs.writeFileSync(tmp, '', { mode: 0o600 });
+      fs.renameSync(tmp, reloadRequestFile);
+      return true;
+    } catch {
+      try {
+        fs.unlinkSync(tmp);
+      } catch {
+        // nothing to clean up
+      }
+      return false;
+    }
+  }
+
+  // POST /__liivo/bridge/reload, gateway token only (same channel as /__liivo/status). Honoured only when the bridge
+  // is idle: 202 after recording the request for the supervisor (which checks idle again right before it stops the
+  // bridge), 409 otherwise with nothing changed. The answer never waits for the stop or the fetch.
+  async function reload(req, res) {
+    const unauthorized = () => text(res, 401, 'application/json', '{"error":"unauthorized"}\n', { 'WWW-Authenticate': 'Bearer' });
+    const v = auth.verifyToken(handoffKey, bearer(req), 'gateway', now());
+    if (!v.ok || instanceMismatch(v.claims)) return unauthorized();
+    learn(v.claims);
+    if (req.method !== 'POST') {
+      return text(res, 405, 'application/json', '{"error":"method not allowed"}\n', { Allow: 'POST' });
+    }
+    const refuse = (reason) => text(res, 409, 'application/json', `${JSON.stringify({ reload: 'refused', reason })}\n`);
+    let idle = await readIdle();
+    if (idle === null && readBridgeState(bridgeStateFile).state === 'starting') idle = true;
+    if (idle === false) return refuse('busy');
+    if (idle !== true) return refuse('unknown');
+    if (!recordReload()) return refuse('unknown');
+    text(res, 202, 'application/json', '{"reload":"started"}\n');
+  }
+
   const server = http.createServer((req, res) => {
     if (!handoffKey) {
       // Fail closed: nothing is served without a key to check sessions against.
@@ -286,6 +378,11 @@ function createForwarder({
     if (target.path === STATUS_PATH) {
       req.resume();
       status(req, res);
+      return;
+    }
+    if (target.path === RELOAD_PATH) {
+      req.resume();
+      reload(req, res);
       return;
     }
     if (req.method === 'GET' && target.path === '/' && target.params.has(HANDOFF_PARAM)) {
@@ -383,11 +480,12 @@ function createForwarder({
         res.destroy();
         return;
       }
+      const page = page502(defaultStartStatus(projectDir, startStateDir));
       res.writeHead(502, {
         'Content-Type': 'text/html; charset=utf-8',
-        'Content-Length': Buffer.byteLength(PAGE_502),
+        'Content-Length': Buffer.byteLength(page),
       });
-      res.end(PAGE_502);
+      res.end(page);
     });
     res.on('close', () => upstream.destroy());
     req.pipe(upstream);
@@ -459,9 +557,10 @@ function createForwarder({
       } else if (toBridge && socket.writable) {
         socket.end(`HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\nContent-Length: 0\r\nRetry-After: 2\r\n\r\n`);
       } else if (socket.writable) {
+        const page = page502(defaultStartStatus(projectDir, startStateDir));
         socket.end(
           'HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\nContent-Type: text/html; charset=utf-8\r\n' +
-            `Content-Length: ${Buffer.byteLength(PAGE_502)}\r\n\r\n${PAGE_502}`
+            `Content-Length: ${Buffer.byteLength(page)}\r\n\r\n${page}`
         );
       } else {
         socket.destroy();

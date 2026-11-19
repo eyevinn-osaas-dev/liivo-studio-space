@@ -111,11 +111,15 @@ removed from the `Cookie` header; other cookies pass).
   links here so the browser passes the OSC gate on a gated path before an SPA's
   root loads).
 - `GET /__liivo/status` is the status endpoint (see below).
+- `POST /__liivo/bridge/reload` is the bridge reload (see "Bridge reload" below). It is the one
+  exception to the 404 for `/__liivo/bridge/*`: it is handled before the session check, like
+  `/__liivo/status`, so a browser, a page on the previewed origin and any request without a
+  valid `aud` `gateway` token get 401.
 - `GET` and `HEAD` requests and WebSocket upgrades under `/__liivo/` (the chat,
   its script and its WebSocket) go to the bridge on `127.0.0.1:4777`, after the
   session check (see "The bridge" below). Any other method answers 405 and is not
   forwarded.
-- `/__liivo/bridge/*`, `/__liivo/open/x`, `/__liivo/status/x`, `/__liivo/` and any
+- Every other `/__liivo/bridge/*` path, `/__liivo/open/x`, `/__liivo/status/x`, `/__liivo/` and any
   target that is not already in plain form (percent-encoded, dot segments, a
   doubled slash, absolute-form, another letter case) are reserved and answer 404
   (with a session), whatever the bridge does.
@@ -229,15 +233,89 @@ as the directory holds a checkout or any file; a failed attempt removes only wha
 created (the directory it made, or the files it put into the empty directory it
 found). Every attempt is logged in `~/liivo-clone.log` with its time and in the
 entrypoint log with its cause (the tenant is not known yet, authentication failed,
-repository not found, invalid URL). A permanent failure is retried the same way, so
-the log says why. The URL is masked in the log. When the clone succeeds,
+repository not found, invalid URL, timed out). The cause is read from that
+attempt's own output, so an attempt that names no cause says "see
+`~/liivo-clone.log`" and never repeats an earlier attempt's cause. A permanent
+failure is retried the same way, so the log says why. The URL is masked in the
+log.
+
+Every attempt, the first one and each retry, runs under a time limit of 120 s. A git
+that does not stop at the limit is killed 10 s later. An attempt stopped this way
+counts as a failed attempt: `~/liivo-clone.log` records that it timed out after N s,
+the entrypoint log gives "timed out after Ns" as its cause, and the retry goes on
+as usual. The first attempt runs before the agent starts, so a hung first attempt
+delays the agent by at most the limit plus the 10 s. The hooks start no later than
+the retry budget, plus one steady delay (60 s), plus the limit, plus the 10 s after
+the first failure. A failed attempt that git ended by the time limit or by a signal
+owns what it left, so it also removes a partial `.git` from the empty directory. An
+attempt that exited by itself and left a `.git/HEAD` leaves the directory alone,
+because that can be a checkout made by hand; the retry then ends with "no longer
+empty, not cloning". A clone that needs more than the limit never finishes through
+the retry, because git starts from zero on every attempt; clone it by hand in that
+case. When the clone succeeds,
 `~/.liivo/project-cloned` is written. `.liivo/setup.sh` and `.liivo/start.sh` run
 after the clone succeeded or the budget is spent, never against an empty directory
 while a retry is pending; the agent and the edit proxy start at once and do not
 wait. If the repository is still unreachable after the budget, restart the
 workspace or run `git clone` or `git pull` by hand. The delays and budget can be
 changed with `LIIVO_CLONE_RETRY_DELAYS`, `LIIVO_CLONE_RETRY_STEADY` and
-`LIIVO_CLONE_RETRY_BUDGET` (seconds; used by the tests).
+`LIIVO_CLONE_RETRY_BUDGET` (seconds; used by the tests). The time limit is
+`LIIVO_CLONE_TIMEOUT` (default 120) and the grace before the kill is
+`LIIVO_CLONE_KILL_GRACE` (default 10), both in seconds. They are variables of the
+entrypoint, not options in the maker order.
+
+**Default start (a repository without `.liivo/start.sh`).**
+
+When the repository has no `.liivo/start.sh`, the entrypoint runs `default-start.js`
+(installed as `/usr/local/lib/liivo/default-start.js`, mode 755, Node built-ins only)
+through the same `setsid` wrapper as an own start.sh, so `/tmp/liivo-start-<dir>.pid`
+holds its group leader from the first moment and install, build and the dev server are
+in that group. A repository's own `.liivo/start.sh` always wins (any file, executable
+or not): nothing of the default runs, the state file is never read, the page is the
+unchanged one. Nothing is generated into the repository.
+
+- **Detection.** `package.json` in the root; the script is `scripts.dev`, else
+  `scripts.start`. Neither (or no or invalid `package.json`): nothing starts and the
+  state is `none` with the reason. Lockfile order: `pnpm-lock.yaml` (pnpm), `yarn.lock`
+  (yarn), `package-lock.json` or `npm-shrinkwrap.json` (npm), none (npm). With several,
+  the first wins and the log names the others. Only a bun lockfile: `failed`, add
+  `.liivo/start.sh`. Other stacks and monorepo workspaces are out of scope.
+- **Install never writes a tracked file.** npm `ci`; pnpm `install --frozen-lockfile`;
+  yarn `install --frozen-lockfile` (yarn 1) or `--immutable` (yarn 2 and later, read
+  from `yarn --version`); no lockfile: `npm install --no-package-lock`. A frozen install
+  that fails is a failure, never retried with a lockfile-writing install. The install
+  runs when there is no record, the lockfile hash (of `package.json` without a lockfile)
+  differs from the record in `~/.liivo/default-start-<dir>.install`, or `node_modules`
+  is missing. A failed, stopped or timed-out install records nothing.
+- **Clean tree.** When git does not ignore `node_modules`, `/node_modules/` is added to
+  `.git/info/exclude` (local, never committed) before the install, because the bridge
+  commits with `git add -A`.
+- **Build.** When the script is `start` and `package.json` has `build`, `build` runs
+  before `start` on every start. `dev` never builds.
+- **Port and host.** The port is `LIIVO_PREVIEW_PORT` (not `LIIVO_PORT`). Every script
+  gets `PORT=<port>` and `HOST=127.0.0.1`. A single `next dev`, `next start`, `vite`,
+  `vite dev`, `vite serve` or `vite preview` script also gets `-H 127.0.0.1 -p <port>`
+  or `--host 127.0.0.1 --port <port> --strictPort` appended once (npm passes them after
+  `--`). A compound command or a script with its own host or port flag gets only the
+  environment and one log line.
+- **Limits** (entrypoint variables, not maker options): `LIIVO_DEFAULT_INSTALL_TIMEOUT`
+  (900 s, shared by install and build), `LIIVO_DEFAULT_START_TIMEOUT` (300 s until the
+  port accepts a connection), `LIIVO_DEFAULT_KILL_GRACE` (10 s between SIGTERM and
+  SIGKILL). A limit that fires stops the work it timed.
+- **Log and state.** Output and one `=== <UTC time> default start: <step and command>`
+  line per step go to `/tmp/liivo-start-<dir>.log`; `~/liivo-run.log` names that file.
+  `/tmp/liivo-start-<dir>.state` is JSON `{"state","reason"}` with state `installing`,
+  `starting`, `running`, `failed` or `none`. A SIGTERM (a bridge restart) writes nothing.
+  The entrypoint removes a leftover state file at start.
+- **Page.** The 502 "Preview not running" page keeps its title, heading and chat tag and
+  adds a status line (installing, starting, failed with the reason and the log path,
+  nothing to start), and reloads itself every 4 s while installing or starting. The state
+  file is untrusted input: a regular file below 2 KiB, a known state, an escaped and
+  capped reason, no log content; anything else gives the page as it was.
+- **Refresh restart.** The entrypoint passes `LIIVO_DEFAULT_START` (the installed path)
+  to the bridge. Until the bridge in Eyevinn/liivo-studio uses it, a refresh does not
+  restart a default-started dev server (Next.js and Vite hot-reload), and a lockfile
+  changed by a refresh is installed at the next workspace start.
 
 **Bridge token.** The same socket answers `POST /bridge-token` with an `aud`
 `bridge` token that lives 45 s (the browser tokens' slack for clock skew) and the
@@ -306,6 +384,50 @@ gateway image carries it as one tarball whose version is the gateway's build.
   else: no `HANDOFF_KEY`, no `CODER_AGENT_*`, no other secret. `state.json` (state and
   version) and `running.json` (version, pid, start time) are written in
   `~/.liivo/bridge/`; `/__liivo/status` reports the state.
+- **Bridge reload.** `POST /__liivo/bridge/reload` with `Authorization: Bearer <token
+  aud=gateway>` (same token, instance check and `learn` as `/__liivo/status`; any other
+  method with a valid token answers 405 `Allow: POST`; a WebSocket upgrade to the path is
+  not answered by the route). It is honoured only when the bridge is idle (no Claude turn
+  running and no pending permission request, which is `busy === false`):
+  - The forwarder reads `GET http://127.0.0.1:4777/health` once (deadline 2 s, under the
+    gateway's 5 s abort). 200 JSON with boolean `busy === false` is honoured: it writes the
+    request file `~/.liivo/bridge/reload-request` (mode 0600, atomic rename, only its
+    existence is read) and answers `202 {"reload":"started"}` at once, never waiting for the
+    stop or the fetch. `busy === true` answers `409 {"reload":"refused","reason":"busy"}`.
+    A 200 without a boolean `busy`, a non-200, a body that is not JSON, a request file
+    that cannot be written: `409 {"reload":"refused","reason":"unknown"}`. A refusal
+    changes nothing (no file, no signal, no fetch). 2xx means "recorded", not "the supervisor
+    is alive"; the gateway (Eyevinn/liivo-studio#48) reads the status class only.
+  - No answer from the bridge at all (refused, timeout) follows `state.json`: `starting`
+    (the bridge exited, the supervisor will restart the cached one) is honoured, `running` (a
+    live process that does not answer may be mid-turn) and `unavailable` are refused with
+    reason `unknown`.
+  - The supervisor polls once a second while the bridge runs. With a request present it reads
+    the same `/health` itself (curl and jq, 2 s) right before it signals and sends SIGTERM to the
+    bridge it started (never a pid from a file) only on a 200 JSON answer with boolean
+    `busy === false`. Anything else (busy, no answer, non-200, malformed) keeps the request and
+    touches nothing. The stop is not a crash: the 1 to 30 s restart wait and its doubling are
+    untouched, no "restarting in" log. The fetcher then runs again so `current` points at the
+    gateway's current version and that bridge starts (`state.json` is `starting` meanwhile, then
+    `running` with the new version). A fetch that fails falls back as it always does (the newest
+    verified cached bridge, or none and the 5 to 60 s backoff with state `unavailable`).
+  - A request that exists when the supervisor leaves its restart wait after an exit makes the
+    next step a fetch instead of a restart of the cached bridge. A request written during a fetch is
+    satisfied by that fetch. No `/health` read is made when no bridge runs.
+  - The entrypoint deletes any request file left on the volume before the supervisor starts. A
+    request that the supervisor keeps (busy bridge) is deleted without acting once it is
+    older than 300 s (`RELOAD_MAX_AGE` in `osc-entrypoint.sh`), so a request recorded during a long
+    turn cannot reload the bridge at a much later idle moment; the gateway asks again at a
+    later open (its own throttle, 10 minutes).
+  - **What an idle read cannot see.** The interval between the supervisor's last read and the
+    delivery of the signal; the bridge's change operations, which run with `busy` false (the
+    commit and push after each turn, "Skicka in" and "Släng"), which is the typical case
+    for a kept request's first idle read; and `refreshRepos` (its `update.sh` hook and `startRepo`).
+    A SIGTERM cuts each of them. The drain that closes this lives in the bridge: Eyevinn/liivo-studio
+    "Bridge: on SIGTERM wait for the work in flight (running turn, change operation, refreshRepos)
+    before exiting" (#52), not here.
+  - The same uid can write the request file, but it can only start a reload of a bridge that the
+    supervisor reads as idle, which that code could already cause by killing the bridge.
 - **`.liivo/start.sh`.** The entrypoint runs it as the leader of its own process
   group and writes its id to `/tmp/liivo-start-<project dir name>.pid`, which is how
   the bridge stops and restarts it after it moved the checkout to newer code.

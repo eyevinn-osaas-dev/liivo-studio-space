@@ -41,7 +41,7 @@ ARG CLAUDE_CODE_VERSION=2.1.323
 # assertion (first word of `claude --version` equals the pin) catches an installer that ignores the pinned argument or leaves no binary.
 RUN mise use -g node@22 && npm i -g corepack && corepack enable
 RUN bash -o pipefail -c 'curl -fsSL https://claude.ai/install.sh | bash -s "$CLAUDE_CODE_VERSION"' \
- && [ "$(claude --version | awk '{print $1}')" = "${CLAUDE_CODE_VERSION}" ]
+ && [ "$(claude --version | head -n1 | awk '{print $1}')" = "${CLAUDE_CODE_VERSION}" ]
 
 # Image copy of home, restored into an empty home volume on first start.
 USER root
@@ -51,7 +51,10 @@ COPY --chmod=755 osc-entrypoint.sh /usr/local/bin/osc-entrypoint.sh
 # module, the git status reader and the git credential helper. Every file the
 # forwarder requires must be listed here. Uses the default Node from mise, which
 # the entrypoint has on PATH.
-COPY --chmod=644 forwarder/preview-forwarder.js forwarder/auth.js forwarder/workspace-status.js forwarder/git-credential-liivo.js forwarder/inject.js forwarder/bridge-fetch.js /usr/local/lib/liivo/
+COPY --chmod=644 forwarder/preview-forwarder.js forwarder/auth.js forwarder/workspace-status.js forwarder/git-credential-liivo.js forwarder/inject.js forwarder/bridge-fetch.js forwarder/default-start-status.js /usr/local/lib/liivo/
+# The default start for a repository without .liivo/start.sh (docs/block.md). Executable: the entrypoint
+# and the bridge's restart both run it as a program.
+COPY --chmod=755 default-start.js /usr/local/lib/liivo/
 # Git credentials for github.com come from the gateway through the edit proxy;
 # the helper prints nothing (git goes unauthenticated) when that fails.
 RUN git config --system 'credential.https://github.com.helper' '!node /usr/local/lib/liivo/git-credential-liivo.js'

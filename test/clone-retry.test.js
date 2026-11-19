@@ -42,6 +42,13 @@ const MESSAGES = {
   notfound: 'echo "fatal: repository \'https://github.com/o/r/\' not found" >&2; rc=128',
   partial: 'mkdir -p "$target"; echo half > "$target/half.txt"; echo "fatal: early EOF" >&2; rc=128',
   ok: 'mkdir -p "$target/.liivo"; "$REAL" init -q "$target"; cp "$OUT/start.sh" "$target/.liivo/start.sh"; rc=0',
+  silent: 'rc=1',
+  // Hang modes. The lock is released when the stub ends (a TERM trap), or before a stub that SIGKILL ends.
+  hang: `trap 'rmdir "$OUT/lock" 2>/dev/null; exit 143' TERM; /bin/sleep 60 & wait $!`,
+  hangignore: 'rmdir "$OUT/lock"; trap "" TERM; while :; do /bin/sleep 0.2; done',
+  hanggit: `mkdir -p "$target/.git"; echo "ref: refs/heads/x" > "$target/.git/HEAD"; trap 'rmdir "$OUT/lock" 2>/dev/null; exit 143' TERM; /bin/sleep 60 & wait $!`,
+  killgit: 'mkdir -p "$target/.git"; echo "ref: refs/heads/x" > "$target/.git/HEAD"; rmdir "$OUT/lock"; kill -9 $$',
+  exit128git: 'mkdir -p "$target/.git"; echo "ref: refs/heads/x" > "$target/.git/HEAD"; echo "fatal: early EOF" >&2; rc=128',
 };
 
 // gitScript: the outcome of each clone attempt in order ('tenant', 'auth', 'notfound', 'partial', 'ok'); the last repeats.
@@ -268,4 +275,104 @@ test('the bridge fetcher runs with a clean environment: PATH and HOME, none of t
   assert.strictEqual(env.HOME, w.home);
   assert.ok(env.PATH.startsWith(w.bin));
   for (const k of ['CODER_AGENT_TOKEN', 'CODER_AGENT_URL', 'CLAUDE_CODE_OAUTH_TOKEN', 'ANTHROPIC_API_KEY', 'HANDOFF_KEY', 'REPO_URL']) assert.ok(!(k in env), k);
+});
+
+// Per-attempt cause, time limit and cleanup of a killed attempt (issue #14). LIIVO_CLONE_TIMEOUT has a resolution of
+// one second, so a limit of 1 s ends an attempt between 1 and 2 s.
+const LIMIT = { LIIVO_CLONE_TIMEOUT: '1', LIIVO_CLONE_KILL_GRACE: '1' };
+const cloneLog = (w) => read(path.join(w.home, 'liivo-clone.log'));
+
+test('the cause of each attempt comes from that attempt only: tenant, then not found, then authentication, and the giving-up line names the last', async () => {
+  const w = setup({ gitScript: ['tenant', 'notfound', 'auth'] });
+  const r = await run(w, { LIIVO_CLONE_RETRY_BUDGET: '2' });
+  await until(() => /giving up/.test(r.log()), 'the budget to end');
+  const lines = attemptLines(r.log());
+  assert.match(lines[0], /does not know its tenant yet/);
+  assert.match(lines[1], /repository not found/);
+  assert.match(lines[2], /authentication failed/);
+  assert.match(r.log(), /giving up: authentication failed;/);
+});
+
+test("an attempt whose own output names no cause reports the default, not an earlier attempt's cause", async () => {
+  const w = setup({ gitScript: ['auth', 'silent'] });
+  const r = await run(w, { LIIVO_CLONE_RETRY_BUDGET: '2' });
+  await until(() => /giving up/.test(r.log()), 'the budget to end');
+  const lines = attemptLines(r.log());
+  assert.match(lines[0], /authentication failed/);
+  for (const l of lines.slice(1)) assert.match(l, /see .*liivo-clone\.log/);
+  assert.match(r.log(), /giving up: see .*liivo-clone\.log;/);
+});
+
+test('(a) a first attempt that hangs is stopped after the limit: the agent starts, a retry is pending, the warning names the timeout', { timeout: 40000 }, async () => {
+  const w = setup({ gitScript: ['hang', 'ok'] });
+  const r = await run(w, { ...LIMIT, LIIVO_CLONE_RETRY_DELAYS: '30', LIIVO_CLONE_RETRY_STEADY: '30' });
+  assert.strictEqual(r.status, 0, r.log());
+  assert.ok(fs.existsSync(path.join(w.out, 'agent-env')), 'the agent is started');
+  assert.match(r.log(), /git clone failed \(timed out after 1s\).*retrying in the background/);
+  assert.match(cloneLog(w), /timed out after 1s/);
+  assert.strictEqual(w.count(), 1);
+  assert.ok(!fs.existsSync(hook(w)), 'the hooks wait for the retry');
+  assert.ok(!fs.existsSync(path.join(w.out, 'lock')), 'the stopped attempt is gone');
+});
+
+test('(b) a retry that hangs is stopped and the next attempt clones: marker, hook after the clone, no overlap', { timeout: 40000 }, async () => {
+  const w = setup({ gitScript: ['tenant', 'hang', 'ok'] });
+  const r = await run(w, LIMIT);
+  assert.strictEqual(r.status, 0, r.log());
+  await until(() => read(hook(w)), 'the hook');
+  assert.strictEqual(w.count(), 3);
+  assert.match(attemptLines(r.log())[1], /git clone attempt 2 failed: timed out after 1s/);
+  assert.ok(fs.existsSync(marker(w)));
+  assert.match(read(hook(w)), /git=yes marker=yes clones=3/);
+  assert.strictEqual(read(path.join(w.out, 'overlap')), '', 'two clones never ran at the same time');
+});
+
+test('(c) every attempt hangs: the budget ends, the giving-up line names the timeout, the hooks run and the agent is up', { timeout: 60000 }, async () => {
+  const w = setup({ gitScript: ['hang'], preExistingEmpty: true });
+  const r = await run(w, { ...LIMIT, LIIVO_CLONE_RETRY_BUDGET: '2' });
+  assert.strictEqual(r.status, 0, r.log());
+  assert.ok(fs.existsSync(path.join(w.out, 'agent-env')));
+  await until(() => /giving up/.test(r.log()) && fs.existsSync(path.join(w.home, 'liivo-run.log')), 'the budget to end and the hooks to run', 30000);
+  assert.match(r.log(), /giving up: timed out after 1s;/);
+  assert.ok(w.count() >= 2);
+  assert.ok(!fs.existsSync(marker(w)));
+  assert.strictEqual(read(path.join(w.out, 'overlap')), '');
+});
+
+test('a git that ignores SIGTERM is killed after the grace, so the attempt cannot hold the entrypoint', { timeout: 40000 }, async () => {
+  const w = setup({ gitScript: ['hangignore', 'ok'] });
+  const r = await run(w, LIMIT);
+  assert.strictEqual(r.status, 0, r.log());
+  await until(() => read(hook(w)), 'the hook');
+  assert.strictEqual(w.count(), 2);
+  assert.match(cloneLog(w), /timed out after 1s/);
+  assert.ok(fs.existsSync(marker(w)));
+});
+
+for (const [label, mode] of [
+  ['stopped by the limit', 'hanggit'],
+  ['killed by SIGKILL', 'killgit'],
+]) {
+  test(`(3a) an attempt ${label} that left .git/HEAD in the empty directory is cleaned, and the next attempt clones`, { timeout: 40000 }, async () => {
+    const w = setup({ gitScript: [mode, 'ok'], preExistingEmpty: true });
+    const r = await run(w, LIMIT);
+    assert.strictEqual(r.status, 0, r.log());
+    await until(() => read(hook(w)), 'the hook');
+    assert.strictEqual(w.count(), 2);
+    assert.strictEqual((cloneLog(w).match(/removed the partial checkout/g) || []).length, 1);
+    assert.ok(fs.existsSync(marker(w)));
+    assert.match(read(hook(w)), /git=yes marker=yes clones=2/);
+    assert.ok(fs.existsSync(path.join(w.project, '.git', 'objects')), 'the .git is the complete one from the real init');
+    assert.doesNotMatch(r.log(), /no longer empty/);
+  });
+}
+
+test('(3b) an attempt that exits 128 by itself with .git/HEAD leaves the directory alone and the retry ends', async () => {
+  const w = setup({ gitScript: ['exit128git', 'ok'], preExistingEmpty: true });
+  const r = await run(w);
+  assert.strictEqual(r.status, 0, r.log());
+  await until(() => /no longer empty, not cloning/.test(r.log()), 'the retry to end');
+  assert.strictEqual(w.count(), 1);
+  assert.ok(fs.existsSync(path.join(w.project, '.git', 'HEAD')), 'the checkout is untouched');
+  assert.doesNotMatch(cloneLog(w), /removed the partial checkout/);
 });

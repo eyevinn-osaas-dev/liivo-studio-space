@@ -53,6 +53,20 @@ function setup({ fetchRcs = [0], bridge = 'stay', agentScript = '', libFiles = t
   fs.writeFileSync(path.join(bin, 'coder'), `#!/bin/bash\nenv > "${out}/agent-env"\n${agentScript}\n`, { mode: 0o755 });
   // sleep: records its argument and waits a moment, so a backoff of 60 s costs nothing
   fs.writeFileSync(path.join(bin, 'sleep'), `#!/bin/bash\necho "$1" >> "${out}/sleeps"\nexec /bin/sleep 0.05\n`, { mode: 0o755 });
+  // curl: stands in for the bridge's loopback /health. The file `health` holds the answer: a JSON body, `none` (no
+  // answer, exit 7) or `500` (an HTTP error, exit 22 under -f).
+  fs.writeFileSync(path.join(out, 'health'), '{"ok":true,"busy":false}');
+  fs.writeFileSync(
+    path.join(bin, 'curl'),
+    `#!/bin/bash
+echo "$*" >> "${out}/curl-calls"
+h="$(cat "${out}/health")"
+[ "$h" = none ] && exit 7
+[ "$h" = 500 ] && exit 22
+echo "$h"
+`,
+    { mode: 0o755 }
+  );
   fs.writeFileSync(
     path.join(bin, 'node'),
     `#!/bin/bash
@@ -148,7 +162,7 @@ test('no author configured and none in the environment: the entrypoint warns and
 
 const EXPECTED_BRIDGE_ENV = [
   'PATH', 'HOME', 'LANG', 'LIIVO_REPO_DIR', 'LIIVO_PREVIEW_PORT', 'LIIVO_GATEWAY_URL', 'LIIVO_INSTANCE', 'OSC_HOSTNAME',
-  'LIIVO_PREVIEW_URL', 'LIIVO_BRIDGE_PORT', 'DISABLE_UPDATES', 'DISABLE_AUTOUPDATER',
+  'LIIVO_PREVIEW_URL', 'LIIVO_BRIDGE_PORT', 'LIIVO_DEFAULT_START', 'DISABLE_UPDATES', 'DISABLE_AUTOUPDATER',
 ];
 // what bash itself adds to a script's environment
 const SHELL_ADDED = new Set(['PWD', 'SHLVL', '_', 'OLDPWD']);
@@ -170,6 +184,7 @@ test('the bridge runs with env -i and the minimal list: the Claude credential an
   assert.strictEqual(env.DISABLE_UPDATES, '1');
   assert.strictEqual(env.DISABLE_AUTOUPDATER, '1');
   assert.strictEqual(env.LIIVO_BRIDGE_PORT, '4777');
+  assert.strictEqual(env.LIIVO_DEFAULT_START, path.join(w.lib, 'default-start.js'), 'the installed default start, for the bridge');
   assert.strictEqual(env.LIIVO_REPO_DIR, w.project);
   assert.strictEqual(env.LIIVO_INSTANCE, 'tenant-proj');
   assert.strictEqual(env.LIIVO_GATEWAY_URL, 'https://studio.example.test');
@@ -296,4 +311,97 @@ test('start.sh still gets loopback, and none of the agent variables or the Claud
   const env = envOf(path.join(w.dir, 'start-env'));
   assert.strictEqual(env.HOST, '127.0.0.1');
   for (const k of ['CODER_AGENT_TOKEN', 'CODER_AGENT_URL', 'CLAUDE_CODE_OAUTH_TOKEN', 'HANDOFF_KEY']) assert.ok(!(k in env), k);
+});
+
+// ---- bridge reload (POST /__liivo/bridge/reload: the supervisor's side) ----
+
+const bridgeDir = (w) => path.join(w.home, '.liivo', 'bridge');
+const requestFile = (w) => path.join(bridgeDir(w), 'reload-request');
+const bridgeStarts = (w) => fs.readdirSync(w.out).filter((n) => /^bridge-env\./.test(n)).length;
+const fetchRuns = (w) => read(path.join(w.out, 'fetch-runs')).trim().split('\n').filter(Boolean).length;
+const stateOf = (w) => JSON.parse(read(path.join(bridgeDir(w), 'state.json')));
+
+test('reload with an idle bridge: the bridge is stopped without a crash backoff, the fetcher runs again, a new bridge starts, the request is gone', async () => {
+  const w = setup();
+  const r = await run(w);
+  await until(() => bridgeStarts(w) === 1, 'the first bridge');
+  assert.strictEqual(fetchRuns(w), 1);
+  fs.writeFileSync(requestFile(w), '');
+  await until(() => bridgeStarts(w) === 2, 'the bridge to be replaced');
+  assert.strictEqual(fetchRuns(w), 2);
+  assert.ok(!fs.existsSync(requestFile(w)));
+  assert.match(r.log(), /bridge stopped for a reload/);
+  assert.doesNotMatch(r.log(), /restarting in/);
+  assert.ok(!fs.existsSync(path.join(w.out, 'sleeps')), 'no restart wait ran: a reload is not a crash');
+  await until(() => stateOf(w).state === 'running', 'state running');
+  assert.strictEqual(stateOf(w).version, 'vtest');
+  assert.match(read(path.join(bridgeDir(w), 'running.json')), /"version":"vtest"/);
+});
+
+test('reload while the bridge is busy: pid unchanged, request kept, fetcher not re-run; when it turns idle the bridge is replaced', async () => {
+  const w = setup();
+  fs.writeFileSync(path.join(w.out, 'health'), '{"busy":true}');
+  await run(w);
+  await until(() => bridgeStarts(w) === 1, 'the first bridge');
+  const pid1 = read(path.join(bridgeDir(w), 'running.json'));
+  fs.writeFileSync(requestFile(w), '');
+  await until(() => read(path.join(w.out, 'curl-calls')), 'a health read');
+  await sleep(2500);
+  assert.strictEqual(bridgeStarts(w), 1);
+  assert.strictEqual(fetchRuns(w), 1);
+  assert.ok(fs.existsSync(requestFile(w)), 'the request stays until it is honoured');
+  assert.strictEqual(read(path.join(bridgeDir(w), 'running.json')), pid1);
+  fs.writeFileSync(path.join(w.out, 'health'), '{"busy":false}');
+  await until(() => bridgeStarts(w) === 2, 'the bridge to be replaced once idle');
+  assert.strictEqual(fetchRuns(w), 2);
+  assert.ok(!fs.existsSync(requestFile(w)));
+  assert.notStrictEqual(read(path.join(bridgeDir(w), 'running.json')), pid1);
+});
+
+test('no answer, a 500 and a malformed body each keep the request and leave the bridge alone', async () => {
+  for (const health of ['none', '500', 'not json', '{"ok":true}', '{"busy":"false"}']) {
+    const w = setup();
+    fs.writeFileSync(path.join(w.out, 'health'), health);
+    await run(w);
+    await until(() => bridgeStarts(w) === 1, 'the first bridge');
+    fs.writeFileSync(requestFile(w), '');
+    await until(() => read(path.join(w.out, 'curl-calls')), 'a health read');
+    await sleep(1500);
+    assert.strictEqual(bridgeStarts(w), 1, health);
+    assert.strictEqual(fetchRuns(w), 1, health);
+    assert.ok(fs.existsSync(requestFile(w)), health);
+  }
+});
+
+test('a request older than the bound is deleted without acting: bridge unchanged, no fetch, no health read', async () => {
+  const w = setup();
+  const r = await run(w);
+  await until(() => bridgeStarts(w) === 1, 'the first bridge');
+  fs.writeFileSync(requestFile(w), '');
+  const old = new Date(Date.now() - 3600 * 1000);
+  fs.utimesSync(requestFile(w), old, old);
+  await until(() => !fs.existsSync(requestFile(w)), 'the aged request to be deleted');
+  await sleep(1200);
+  assert.strictEqual(bridgeStarts(w), 1);
+  assert.strictEqual(fetchRuns(w), 1);
+  assert.ok(!fs.existsSync(path.join(w.out, 'curl-calls')));
+  assert.match(r.log(), /expired/);
+});
+
+test('a request written while the bridge is down (state starting) makes the next step a fetch, not a restart of the cached bridge', async () => {
+  const w = setup({ bridge: 'exit' });
+  await run(w);
+  await until(() => bridgeStarts(w) >= 1, 'the first bridge run');
+  fs.writeFileSync(requestFile(w), '');
+  await until(() => fetchRuns(w) >= 2, 'a second fetch');
+  assert.ok(!fs.existsSync(requestFile(w)));
+});
+
+test('a request left on the volume by an earlier run is deleted by the entrypoint before the supervisor starts', async () => {
+  const w = setup({ fetchRcs: ['block'] });
+  fs.mkdirSync(bridgeDir(w), { recursive: true });
+  fs.writeFileSync(requestFile(w), '');
+  const r = await run(w);
+  assert.strictEqual(r.status, 0, r.log());
+  assert.ok(!fs.existsSync(requestFile(w)));
 });

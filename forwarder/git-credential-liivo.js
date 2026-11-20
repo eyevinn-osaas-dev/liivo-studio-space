@@ -1,8 +1,13 @@
 'use strict';
-// git credential helper for https://github.com in the Liivo Studio workspace
-// (`git config --system credential.https://github.com.helper '!node <this file>'`).
+// git credential helper for https://github.com and the project's managed-Gitea host in the Liivo
+// Studio workspace. github.com is configured at build time
+// (`git config --system credential.https://github.com.helper '!node <this file>'`); the managed-Gitea
+// host is configured by the entrypoint at start (`git config --global credential.https://<host>.helper
+// '!node <this file> --host=<host>'`). It answers for github.com and for each `--host=<h>` argument,
+// compared exactly and case-insensitively (no prefix, suffix or port matching); any other host gets no
+// output and no gateway call.
 //
-// git calls it as `<helper> get` with key=value lines on stdin. The helper asks
+// git calls it as `<helper> [--host=<h>] get` (the action is the LAST argument) with key=value lines on stdin. The helper asks
 // the edit proxy on a unix socket to sign an `aud` git token (the handoff key
 // never leaves the proxy), sends that token to ${LIIVO_GATEWAY_URL}/api/git-token
 // and prints what the gateway returns. If anything fails it prints nothing, so
@@ -50,14 +55,21 @@ function signToken() {
   });
 }
 
+function allowedHosts(args) {
+  const hosts = new Set(['github.com']);
+  for (const a of args) if (a.startsWith('--host=') && a.length > 7) hosts.add(a.slice(7).toLowerCase());
+  return hosts;
+}
+
 async function main() {
-  if (process.argv[2] !== 'get') return;
+  const args = process.argv.slice(2);
+  if (args[args.length - 1] !== 'get') return;
   const attrs = {};
   for (const line of (await readStdin()).split('\n')) {
     const i = line.indexOf('=');
     if (i > 0) attrs[line.slice(0, i)] = line.slice(i + 1);
   }
-  if (attrs.protocol !== 'https' || attrs.host !== 'github.com') return;
+  if (attrs.protocol !== 'https' || !allowedHosts(args).has(String(attrs.host).toLowerCase())) return;
 
   let signed;
   try {

@@ -27,7 +27,13 @@ const DEFAULT_BRIDGE_PORT = 4777;
 // What of the /__liivo/ namespace the bridge may serve: a plain path of letters, digits, dots, dashes and
 // underscores, no dot segment, and not the proxy's own (`open`, `status`) or the reserved `bridge/`.
 const BRIDGE_PATH_RE = /^\/__liivo\/[A-Za-z0-9._-]+(?:\/[A-Za-z0-9._-]+)*$/;
-const PROXY_OWN = new Set(['open', 'status', 'bridge']);
+// F2 (Eyevinn/liivo-studio#45, N1): the chat itself is served by the gateway on its own origin, so the chat's page, script,
+// stylesheet and font are not served on this origin at all (404), and the chat's WebSocket (`ws`) answers the gateway's
+// bearer token only (see the upgrade handler), never the session cookie that scripts of the previewed page ride on.
+const CHAT_OWN = ['chat.html', 'chat.js', 'chat.css', 'inter.woff2', 'ws'];
+const PROXY_OWN = new Set(['open', 'status', 'bridge', ...CHAT_OWN]);
+const SOCKET_PATH = '/__liivo/ws';
+const HOST_RE = /^[a-z0-9]([a-z0-9.-]*[a-z0-9])?$/;
 const BRIDGE_STATES = new Set(['running', 'starting', 'unavailable']);
 const VERSION_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
 const BRIDGE_STARTING = '{"bridge":"starting"}\n';
@@ -538,13 +544,28 @@ function createForwarder({
       reply('503 Service Unavailable');
       return;
     }
-    if (!auth.sessionFromCookieHeader(handoffKey, req.headers.cookie, now()) || crossOrigin(req)) {
+    // The chat's WebSocket: the gateway's bearer token only (audience gateway, this instance, a public host in its claims).
+    // The session cookie is not a credential here, with or without a matching Origin: scripts of the previewed page hold it.
+    const toBridge = pathOf(req.url) === SOCKET_PATH;
+    let socketHost = '';
+    if (toBridge) {
+      const v = auth.verifyToken(handoffKey, bearer(req), 'gateway', now());
+      if (!v.ok || instanceMismatch(v.claims)) {
+        reply('401 Unauthorized');
+        return;
+      }
+      socketHost = String(v.claims.host || '').toLowerCase();
+      if (!HOST_RE.test(socketHost)) {
+        reply('401 Unauthorized');
+        return;
+      }
+      learn(v.claims);
+    } else if (!auth.sessionFromCookieHeader(handoffKey, req.headers.cookie, now()) || crossOrigin(req)) {
       reply('401 Unauthorized');
       return;
     }
-    // /__liivo/ws and the like go to the bridge, in the same tunnel as the preview's own upgrades (its HMR).
-    const toBridge = Boolean(bridgePathOf(req.url));
-    if (isReserved(req.url) && !toBridge) {
+    // Every other /__liivo/ upgrade is the proxy's own namespace: nothing there is a WebSocket.
+    if (!toBridge && isReserved(req.url)) {
       reply('404 Not Found');
       return;
     }
@@ -568,6 +589,21 @@ function createForwarder({
     });
     upstream.on('connect', () => {
       established = true;
+      if (toBridge) {
+        // A fresh request head built from named parts only: the bridge checks `Origin` equals `https://<Host>`, so both are the
+        // workspace's public host from the verified token. No Authorization, no cookie, no forwarded header goes on.
+        const h = req.headers;
+        const lines = [`GET ${SOCKET_PATH} HTTP/1.1`, `Host: ${socketHost}`, `Origin: https://${socketHost}`, 'Connection: Upgrade', 'Upgrade: websocket'];
+        for (const name of ['sec-websocket-key', 'sec-websocket-version', 'sec-websocket-protocol']) {
+          const value = h[name];
+          if (typeof value === 'string' && !/[\r\n]/.test(value)) lines.push(`${name}: ${value}`);
+        }
+        upstream.write(`${lines.join('\r\n')}\r\n\r\n`);
+        if (head && head.length) upstream.write(head);
+        socket.pipe(upstream);
+        upstream.pipe(socket);
+        return;
+      }
       let rawHead = `${req.method} ${req.url} HTTP/${req.httpVersion}\r\n`;
       for (let i = 0; i < req.rawHeaders.length; i += 2) {
         const name = req.rawHeaders[i];

@@ -120,6 +120,36 @@ FORWARDER="$LIB_DIR/preview-forwarder.js"
 FETCHER="$LIB_DIR/bridge-fetch.js"
 # The default start for a repository without .liivo/start.sh (see run_hooks).
 DEFAULT_START="$LIB_DIR/default-start.js"
+
+# Git credential helper for the project's managed-Gitea host (Eyevinn/liivo-studio#62). The image
+# configures the helper for github.com only (system config, build time); the Gitea host is known here.
+# REPO_URL qualifies only when it is https, has no userinfo or port and its host is exactly
+# <tenant>-<tenant>git.go-gitea-gitea.auto.<env>.osaas.io; that strict match is the only text that ever
+# reaches the shell snippet git runs. An entry left by an earlier start for another host is removed, so
+# one entry remains after any number of starts. Everything runs in `if` context because of `set -eu`.
+git_helper_set() {
+  local host="$1" key
+  while IFS= read -r key; do
+    [ -n "$key" ] || continue
+    [ "$key" = "credential.https://$host.helper" ] || git config --global --unset-all "$key" || return 1
+  done < <(git config --global --name-only --get-regexp '^credential\.https://.*\.helper$' '/git-credential-liivo\.js --host=' 2> /dev/null || true)
+  git config --global "credential.https://$host.helper" "!node $LIB_DIR/git-credential-liivo.js --host=$host"
+}
+GIT_HELPER_HOST=""
+repo_lc="$(printf '%s' "${REPO_URL:-}" | tr '[:upper:]' '[:lower:]')"
+if [[ "$repo_lc" =~ ^https://([a-z0-9]+)-([a-z0-9]+)git\.go-gitea-gitea\.auto\.[a-z0-9-]+\.osaas\.io(/|$) ]] \
+  && [ "${BASH_REMATCH[1]}" = "${BASH_REMATCH[2]}" ]; then
+  GIT_HELPER_HOST="${repo_lc#https://}"
+  GIT_HELPER_HOST="${GIT_HELPER_HOST%%/*}"
+fi
+if [ -n "$GIT_HELPER_HOST" ]; then
+  if git_helper_set "$GIT_HELPER_HOST"; then
+    log "git credential helper configured for $GIT_HELPER_HOST"
+  else
+    log "WARNING: could not configure the git credential helper for $GIT_HELPER_HOST: the clone runs unauthenticated"
+    GIT_HELPER_HOST=""
+  fi
+fi
 forwarder_started=""
 # The orchestrator does not set PORT: the instance's container port is fixed at 8080.
 PORT="${PORT:-8080}"
@@ -211,6 +241,7 @@ supervise_bridge() {
       LIIVO_GATEWAY_URL="${LIIVO_GATEWAY_URL:-}" LIIVO_INSTANCE="$LIIVO_INSTANCE"
       OSC_HOSTNAME="${OSC_HOSTNAME:-}" LIIVO_PREVIEW_URL="${LIIVO_EDIT_URL:-}"
       LIIVO_BRIDGE_PORT="$BRIDGE_PORT" LIIVO_DEFAULT_START="$DEFAULT_START" DISABLE_UPDATES=1 DISABLE_AUTOUPDATER=1)
+    [ -z "$GIT_HELPER_HOST" ] || bridge_env+=(LIIVO_GIT_HOST="$GIT_HELPER_HOST")
     [ -z "${CLAUDE_CODE_OAUTH_TOKEN:-}" ] || bridge_env+=(CLAUDE_CODE_OAUTH_TOKEN="$CLAUDE_CODE_OAUTH_TOKEN")
     [ -z "${ANTHROPIC_API_KEY:-}" ] || bridge_env+=(ANTHROPIC_API_KEY="$ANTHROPIC_API_KEY")
     while true; do

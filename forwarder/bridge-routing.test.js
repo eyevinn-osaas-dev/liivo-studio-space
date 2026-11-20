@@ -168,11 +168,11 @@ const reset = () => { bridgeSeen = []; previewSeen = []; };
 
 // ---- routing: the replacements of the lifted guard tests ----
 
-test('/__liivo/chat.html with a session reaches the bridge, with the host and without the session cookie or forwarded headers', async () => {
+test('/__liivo/vendor/modern-screenshot.js with a session reaches the bridge, with the host and without the session cookie or forwarded headers', async () => {
   reset();
-  const res = await request(fwdPort, { path: '/__liivo/chat.html?x=1', headers: { 'X-Forwarded-Host': 'evil.test', Cookie: `${COOKIE}; other=1` }, session: false });
+  const res = await request(fwdPort, { path: '/__liivo/vendor/modern-screenshot.js?x=1', headers: { 'X-Forwarded-Host': 'evil.test', Cookie: `${COOKIE}; other=1` }, session: false });
   assert.strictEqual(res.status, 200);
-  assert.strictEqual(res.body, 'bridge saw /__liivo/chat.html?x=1');
+  assert.strictEqual(res.body, 'bridge saw /__liivo/vendor/modern-screenshot.js?x=1');
   assert.strictEqual(bridgeSeen.length, 1);
   assert.strictEqual(bridgeSeen[0].headers.host, HOST, 'the public host reaches the bridge (its Origin check needs it)');
   assert.strictEqual(bridgeSeen[0].headers.cookie, 'other=1', 'the session cookie does not reach the bridge');
@@ -188,34 +188,82 @@ test('nested bridge paths and HEAD are forwarded too', async () => {
   assert.deepStrictEqual(bridgeSeen.map((r) => `${r.method} ${r.url}`), ['GET /__liivo/vendor/modern-screenshot.js', 'GET /__liivo/health', 'HEAD /__liivo/client.js']);
 });
 
-test('without a session /__liivo/chat.html and /__liivo/ws answer 401 (a navigation: 302), and nothing reaches the bridge', async () => {
+test('without a session a bridge file answers 401 (a navigation: 302), and nothing reaches the bridge', async () => {
   reset();
-  const noSession = await request(fwdPort, { path: '/__liivo/chat.html', session: false });
+  const noSession = await request(fwdPort, { path: '/__liivo/health', session: false });
   assert.strictEqual(noSession.status, 401);
-  const nav = await request(fwdPort, { path: '/__liivo/chat.html', session: false, headers: { Accept: 'text/html' } });
+  const nav = await request(fwdPort, { path: '/__liivo/health', session: false, headers: { Accept: 'text/html' } });
   assert.strictEqual(nav.status, 302);
   assert.match(nav.headers.location, /\/w\/tenant-proj$/);
-  const ws = await rawExchange(fwdPort, upgradeText('/__liivo/ws', { Origin: `https://${HOST}` }, false));
-  assert.match(ws, /^HTTP\/1\.1 401 /);
   assert.strictEqual(bridgeSeen.length, 0);
 });
 
-test('/__liivo/ws with a session and the page\'s own origin reaches the bridge and relays bytes both ways', async () => {
+// ---- F2 (Eyevinn/liivo-studio#45, N1): the chat is not served here, and its socket answers the gateway's token only ----
+
+const gatewayBearer = (over = {}) =>
+  auth.signToken(KEY, { aud: 'gateway', host: HOST, tenant: 'tenant', user: 'u1', instance: 'tenant-proj', exp: nowS() + 30, ...over });
+const socketText = (headers = {}, p = '/__liivo/ws') =>
+  `GET ${p} HTTP/1.1\r\nHost: ${HOST}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n${Object.entries(headers).map(([k, v]) => `${k}: ${v}\r\n`).join('')}\r\n`;
+
+test('/__liivo/ws with the gateway\'s bearer reaches the bridge with the public host as Host and Origin, no Authorization, no cookie, and relays bytes both ways', async () => {
   reset();
-  const out = await rawExchange(fwdPort, upgradeText('/__liivo/ws', { Origin: `https://${HOST}` }));
+  const out = await rawExchange(fwdPort, socketText({ Authorization: `Bearer ${gatewayBearer()}`, Cookie: COOKIE, 'X-Forwarded-For': '1.2.3.4', 'Sec-WebSocket-Protocol': 'liivo.v1' }));
   assert.match(out, /^HTTP\/1\.1 101 /);
-  assert.ok(out.endsWith('PING'));
+  assert.ok(out.endsWith('PING'), 'bytes flow both ways');
   assert.strictEqual(bridgeSeen.length, 1);
-  assert.strictEqual(bridgeSeen[0].url, '/__liivo/ws');
-  assert.strictEqual(bridgeSeen[0].headers.origin, `https://${HOST}`, 'the bridge sees the Origin its own check compares');
-  assert.strictEqual(bridgeSeen[0].headers.host, HOST);
-  assert.ok(!('cookie' in bridgeSeen[0].headers), 'the session cookie is stripped from the upgrade too');
+  const seen = bridgeSeen[0];
+  assert.strictEqual(seen.url, '/__liivo/ws');
+  assert.strictEqual(seen.headers.host, HOST);
+  assert.strictEqual(seen.headers.origin, `https://${HOST}`, 'the bridge sees the Origin its own check compares');
+  assert.strictEqual(seen.headers['sec-websocket-protocol'], 'liivo.v1');
+  for (const h of ['authorization', 'cookie', 'x-forwarded-for']) assert.ok(!(h in seen.headers), `${h} does not reach the bridge`);
+  assert.strictEqual(previewSeen.length, 0);
 });
 
-test('a cross-origin /__liivo/ws is refused by the proxy and not forwarded', async () => {
+test('/__liivo/ws with only the edit-proxy session answers 401 and is not forwarded, with or without the page\'s own Origin (what a page script has)', async () => {
   reset();
-  const out = await rawExchange(fwdPort, upgradeText('/__liivo/ws', { Origin: 'https://evil.test' }));
-  assert.match(out, /^HTTP\/1\.1 401 /);
+  for (const headers of [{ Cookie: COOKIE, Origin: `https://${HOST}` }, { Cookie: COOKIE }, { Cookie: COOKIE, Origin: 'https://evil.test' }, {}]) {
+    assert.match(await rawExchange(fwdPort, socketText(headers)), /^HTTP\/1\.1 401 /, JSON.stringify(Object.keys(headers)));
+  }
+  assert.strictEqual(bridgeSeen.length, 0);
+  // the spelling does not matter either
+  for (const p of ['/__LIIVO/WS', '/%5f%5fliivo/ws', '//__liivo/ws']) {
+    assert.match(await rawExchange(fwdPort, socketText({ Cookie: COOKIE, Origin: `https://${HOST}` }, p)), /^HTTP\/1\.1 401 /, p);
+  }
+  assert.strictEqual(bridgeSeen.length, 0);
+});
+
+test('/__liivo/ws refuses a bearer that is not the gateway\'s for this instance: other audience, other key, expired, other instance, no host, a token in the URL', async () => {
+  reset();
+  const other = crypto.randomBytes(32);
+  for (const [why, bearer] of [
+    ['audience git', gatewayBearer({ aud: 'git' })], ['audience browser', gatewayBearer({ aud: 'browser' })], ['audience bridge', gatewayBearer({ aud: 'bridge' })],
+    ['another key', auth.signToken(other, { aud: 'gateway', host: HOST, tenant: 'tenant', user: 'u1', instance: 'tenant-proj', exp: nowS() + 30 })],
+    ['expired', gatewayBearer({ exp: nowS() - 5 })], ['too far ahead', gatewayBearer({ exp: nowS() + 600 })],
+    ['another instance', gatewayBearer({ instance: 'other-proj' })], ['no host', gatewayBearer({ host: '' })], ['a host with a space', gatewayBearer({ host: 'a b' })],
+  ]) {
+    assert.match(await rawExchange(fwdPort, socketText({ Authorization: `Bearer ${bearer}` })), /^HTTP\/1\.1 401 /, why);
+  }
+  assert.match(await rawExchange(fwdPort, socketText({ Cookie: COOKIE }, `/__liivo/ws?token=${gatewayBearer()}`)), /^HTTP\/1\.1 401 /, 'a token in the URL is not a credential');
+  assert.strictEqual(bridgeSeen.length, 0);
+});
+
+test('the chat\'s page, script, stylesheet and font are not served on this origin, session or not, and nothing is forwarded; a GET of the socket path is 404 too', async () => {
+  reset();
+  for (const f of ['chat.html', 'chat.js', 'chat.css', 'inter.woff2', 'ws', 'CHAT.HTML', 'Chat.Js']) {
+    assert.strictEqual((await request(fwdPort, { path: `/__liivo/${f}` })).status, 404, `${f} with a session`);
+    assert.strictEqual((await request(fwdPort, { method: 'HEAD', path: `/__liivo/${f}` })).status, 404, `HEAD ${f}`);
+    assert.strictEqual((await request(fwdPort, { path: `/__liivo/${f}`, session: false })).status, 401, `${f} without one`);
+  }
+  assert.strictEqual(bridgeSeen.length, 0);
+  // the files the picker still needs are served, as before
+  for (const f of ['client.js', 'health', 'vendor/modern-screenshot.js']) assert.strictEqual((await request(fwdPort, { path: `/__liivo/${f}` })).status, 200, f);
+});
+
+test('another /__liivo/ upgrade is the proxy\'s own namespace: 404 with a session, 401 without, never forwarded', async () => {
+  reset();
+  assert.match(await rawExchange(fwdPort, upgradeText('/__liivo/other', { Origin: `https://${HOST}` })), /^HTTP\/1\.1 404 /);
+  assert.match(await rawExchange(fwdPort, upgradeText('/__liivo/other', { Origin: `https://${HOST}` }, false)), /^HTTP\/1\.1 401 /);
   assert.strictEqual(bridgeSeen.length, 0);
 });
 
@@ -252,7 +300,7 @@ test('only a plain request target is forwarded: encoded, dotted, doubled, absolu
 test('only GET and HEAD reach the bridge: a POST under /__liivo/ answers 405, and POST /preview goes to the project, never to the bridge', async () => {
   reset();
   for (const method of ['POST', 'PUT', 'DELETE', 'PATCH']) {
-    const res = await request(fwdPort, { method, path: '/__liivo/chat.html', body: method === 'DELETE' ? undefined : 'x' });
+    const res = await request(fwdPort, { method, path: '/__liivo/health', body: method === 'DELETE' ? undefined : 'x' });
     assert.strictEqual(res.status, 405, method);
     assert.strictEqual(res.headers.allow, 'GET, HEAD');
   }
@@ -286,9 +334,9 @@ test('while the bridge is down: client.js is the placeholder, health is 503 star
   const health = await request(downPort, { path: '/__liivo/health' });
   assert.strictEqual(health.status, 503);
   assert.deepStrictEqual(JSON.parse(health.body), { bridge: 'starting' });
-  assert.strictEqual((await request(downPort, { path: '/__liivo/chat.html' })).status, 503);
+  assert.strictEqual((await request(downPort, { path: '/__liivo/vendor/modern-screenshot.js' })).status, 503);
   assert.strictEqual((await request(downPort, { method: 'HEAD', path: '/__liivo/health' })).status, 503);
-  const ws = await rawExchange(downPort, upgradeText('/__liivo/ws', { Origin: `https://${HOST}` }));
+  const ws = await rawExchange(downPort, socketText({ Authorization: `Bearer ${gatewayBearer()}` }));
   assert.match(ws, /^HTTP\/1\.1 503 /);
   // and the placeholder needs the session like everything else
   assert.strictEqual((await request(downPort, { path: '/__liivo/client.js', session: false })).status, 401);

@@ -195,8 +195,8 @@ test('absolute-form, encoded, cased and dot-segment targets hit the reserved nam
 // forwarded", "other /__liivo/ paths are reserved and answer 404, never forwarded") pinned the behaviour
 // before the bridge existed (W1 AC2, liivo-studio-space#3: not ADR-pinned). Since amendment 6 /__liivo/*
 // goes to the bridge after the session check; bridge-routing.test.js has their replacements:
-// /__liivo/chat.html and /__liivo/ws reach a fake bridge with a session and answer 401 without one,
-// /__liivo/bridge/x answers 404, /__liivo/open/x keeps its 404.
+// /__liivo/ws reaches a fake bridge with the gateway's bearer only (F2: the session cookie is no credential for it) and
+// /__liivo/chat.html is 404, /__liivo/bridge/x answers 404, /__liivo/open/x keeps its 404.
 test('/__liivo/open/x and the forms of a request target that are not plain stay reserved and are not forwarded', async () => {
   for (const path of ['/__liivo/open/x', '/__liivo/status/x', '/__liivo/bridge/x', '/__liivo/']) {
     const res = await request(fwdPort, { path });

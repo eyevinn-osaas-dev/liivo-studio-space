@@ -115,10 +115,17 @@ removed from the `Cookie` header; other cookies pass).
   exception to the 404 for `/__liivo/bridge/*`: it is handled before the session check, like
   `/__liivo/status`, so a browser, a page on the previewed origin and any request without a
   valid `aud` `gateway` token get 401.
-- `GET` and `HEAD` requests and WebSocket upgrades under `/__liivo/` (the chat,
-  its script and its WebSocket) go to the bridge on `127.0.0.1:4777`, after the
-  session check (see "The bridge" below). Any other method answers 405 and is not
-  forwarded.
+- `GET` and `HEAD` requests under `/__liivo/` (the picker's `client.js`, its vendor file and
+  `health`) go to the bridge on `127.0.0.1:4777`, after the session check (see "The bridge"
+  below). Any other method answers 405 and is not forwarded.
+- **The chat is not served on this origin (F2, N1).** `/__liivo/chat.html`, `chat.js`,
+  `chat.css` and `inter.woff2` answer 404, session or not: the gateway serves the chat from
+  its own origin. `/__liivo/ws`, the chat's WebSocket, answers **the gateway's bearer token
+  only** (`Authorization: Bearer <aud gateway token>` for this instance, with the workspace's
+  public host in its `host` claim): the edit-proxy session cookie is not a credential for it,
+  with or without a matching `Origin`, because scripts of the previewed page ride that cookie.
+  The upgrade goes to the bridge with `Host` and `Origin` set to that public host, and no
+  `Authorization`, cookie or forwarded header. Every other `/__liivo/` upgrade is 404.
 - Every other `/__liivo/bridge/*` path, `/__liivo/open/x`, `/__liivo/status/x`, `/__liivo/` and any
   target that is not already in plain form (percent-encoded, dot segments, a
   doubled slash, absolute-form, another letter case) are reserved and answer 404
@@ -206,7 +213,9 @@ bearer: 401. If git itself fails: 500, never "clean".
 
 **Git credential helper.** The image sets
 `credential.https://github.com.helper` (system config) to
-`forwarder/git-credential-liivo.js`. For `https://github.com` it asks the
+`forwarder/git-credential-liivo.js`. The entrypoint adds the same helper for the
+project's managed-Gitea host (see "Managed-Gitea host" below). For `https://github.com`
+and that host it asks the
 forwarder, over a unix socket (`$HOME/.liivo/sign.sock`, mode 0600, so the key
 never leaves the forwarder), for an `aud` `git` token (60 s, `tenant`, `user`,
 `instance` as last learned from a verified handoff or status token and kept in
@@ -220,6 +229,23 @@ environment variable. The tenant is learned from the first handoff or status
 call, which reaches a new instance a moment after the entrypoint's first clone, so
 a private repository fails that first attempt. The entrypoint therefore retries
 the clone in the background (see "First clone and retry" below).
+
+### Managed-Gitea host
+
+When `REPO_URL` is `https://<tenant>-<tenant>git.go-gitea-gitea.auto.<env>.osaas.io/...`
+(https, no user name or password, no port, the tenant part repeated, compared in lower
+case), the entrypoint writes
+`git config --global credential.https://<host>.helper '!node <lib>/git-credential-liivo.js --host=<host>'`
+before the first clone, and passes the host to the bridge as `LIIVO_GIT_HOST`. The
+helper answers exactly like for `github.com` (user name `x-access-token`), for that
+host only: the `host` attribute is compared exactly and case-insensitively, so
+another managed-Gitea host, an unrelated host, a port or a suffix gets no output and
+no gateway call. The entry is rewritten at every start (one entry after any number of
+starts) and an entry for another host left by an earlier start is removed. Any other
+`REPO_URL` writes no entry and the bridge gets no `LIIVO_GIT_HOST`, so a public
+repository on any other host clones unauthenticated. If the config write fails the
+entrypoint logs one `WARNING` and goes on; the clone then runs unauthenticated. Until
+the gateway answers for a Gitea project (404), git goes on unauthenticated.
 
 ### First clone and retry
 
@@ -447,10 +473,11 @@ gateway image carries it as one tarball whose version is the gateway's build.
   project's `HandoffKey` service secret can read or download it. Nobody without a
   Studio project row can download it from the gateway. Do not put anything in
   `bridge/` that must stay secret from customers.
-- **Same origin.** Scripts in the previewed page share the chat's origin, so they can
-  open `/__liivo/ws` and drive the chat (amendment 6, N1; closed for customers by
-  moving the chat to another origin, F2). The same uid in the workspace can reach the
-  bridge's loopback port and its files.
+- **Origin of the chat.** The chat is served by the gateway on its own origin and its
+  WebSocket is relayed by the gateway with its bearer token (F2, closes amendment 6 N1 for
+  scripts in the previewed page, which no longer share the chat's origin and hold no
+  credential for its socket). The same uid in the workspace can still reach the bridge's
+  loopback port and its files.
 
 ## Security notes
 

@@ -623,6 +623,53 @@ test('the git credential helper signs a git token, calls the gateway and returns
   }
 });
 
+test('the git credential helper answers for a --host argument exactly and for no other host', async () => {
+  await handoff(browserToken({ tenant: 'tenant', instance: 'tenant-proj' }));
+  const calls = [];
+  const gateway = http.createServer((req, res) => {
+    calls.push(req.url);
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ token: 'gitea_testtoken' }));
+  });
+  const gwPort = await listen(gateway);
+  const proxy = createForwarder({ previewPort: 1, handoffKey: KEY, gatewayUrl: `http://127.0.0.1:${gwPort}`, instance: 'tenant-proj', identityFile, now });
+  const sock = path.join(tmp, 'host.sock');
+  await listenOnSocket(proxy.signer, sock);
+  const project = 'acme-acmegit.go-gitea-gitea.auto.dev.osaas.io';
+  const input = (host, proto = 'https') => `protocol=${proto}\nhost=${host}\n\n`;
+  try {
+    const ok = await runHelper([`--host=${project}`, 'get'], input(project), { LIIVO_SOCKET: sock });
+    assert.strictEqual(ok.stdout, 'username=x-access-token\npassword=gitea_testtoken\n');
+    const upper = await runHelper([`--host=${project}`, 'get'], input(project.toUpperCase()), { LIIVO_SOCKET: sock });
+    assert.strictEqual(upper.stdout, 'username=x-access-token\npassword=gitea_testtoken\n');
+    // github.com still answers when a --host is configured
+    const gh = await runHelper([`--host=${project}`, 'get'], GITHUB, { LIIVO_SOCKET: sock });
+    assert.strictEqual(gh.stdout, 'username=x-access-token\npassword=gitea_testtoken\n');
+    assert.strictEqual(calls.length, 3);
+
+    calls.length = 0;
+    for (const [args, inp] of [
+      [[`--host=${project}`, 'get'], input('other-othergit.go-gitea-gitea.auto.dev.osaas.io')],
+      [[`--host=${project}`, 'get'], input('example.com')],
+      [[`--host=${project}`, 'get'], input(`${project}.evil.example`)],
+      [[`--host=${project}`, 'get'], input(`x${project}`)],
+      [[`--host=${project}`, 'get'], input(`${project}:3000`)],
+      [[`--host=${project}`, 'get'], input(project, 'http')],
+      [[`--host=${project}`, 'store'], `${input(project)}username=x\npassword=y\n`],
+      [[`--host=${project}`, 'erase'], input(project)],
+      [['get'], input(project)], // no --host configured: not this host
+    ]) {
+      const r = await runHelper(args, inp, { LIIVO_SOCKET: sock });
+      assert.strictEqual(r.stdout, '');
+      assert.strictEqual(r.code, 0);
+    }
+    assert.strictEqual(calls.length, 0);
+  } finally {
+    proxy.signer.close();
+    gateway.close();
+  }
+});
+
 test('the git credential helper returns nothing and names the cause when the gateway or the proxy refuses or is unreachable', async () => {
   await handoff(browserToken({ tenant: 'tenant', instance: 'tenant-proj' }));
   const statuses = [403, 404, 503];

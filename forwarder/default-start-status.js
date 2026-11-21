@@ -1,5 +1,6 @@
 'use strict';
-// Status line of the default start (default-start.js) for the "Preview not running" page.
+// Status of the default start (default-start.js) for the preview page: a status line on the "Preview not running"
+// page, or the friendly waiting page while installing or starting.
 // The state file is written by project-writable code, so it is untrusted input: only a regular file (no
 // symlink) below a small size cap is read, only the five known states are accepted, the reason is
 // control-character-stripped, length-capped and HTML-escaped, and no log content is ever rendered.
@@ -23,7 +24,7 @@ function isFile(p) {
   }
 }
 
-// -> { html, refresh } or null.
+// -> { html, refresh } or { waiting: true, refresh: true } (installing, starting) or null.
 function defaultStartStatus(projectDir, stateDir = '/tmp') {
   if (!projectDir) return null;
   // A repository's own start.sh always wins: its page is the unchanged one.
@@ -50,9 +51,9 @@ function defaultStartStatus(projectDir, stateDir = '/tmp') {
   const logPath = escapeHtml(`/tmp/liivo-start-${name}.log`);
   switch (data.state) {
     case 'installing':
-      return { html: '<p>Installing dependencies. This page reloads itself.</p>', refresh: true };
     case 'starting':
-      return { html: '<p>Starting the dev server. This page reloads itself.</p>', refresh: true };
+      // Both render the same friendly waiting page; nothing from the state file is shown.
+      return { waiting: true, refresh: true };
     case 'failed':
       return { html: `<p>The default start failed: ${reason || 'unknown reason'}. See ${logPath}.</p>`, refresh: false };
     case 'none':

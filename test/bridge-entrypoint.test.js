@@ -45,7 +45,8 @@ async function until(fn, what, ms = 15000) {
 }
 
 // fetchRcs: the exit codes of successive fetcher runs (the last repeats); bridgeRuns: 'stay' keeps the bridge up, 'exit' ends it at once.
-function setup({ fetchRcs = [0], bridge = 'stay', agentScript = '', libFiles = true, files = {} } = {}) {
+// bridge 'slow-exit': the bridge has run 61 s (a fake clock, see `date` below) when it exits; fetchOut: what a successful fetcher run prints.
+function setup({ fetchRcs = [0], bridge = 'stay', agentScript = '', libFiles = true, files = {}, sleepSecs = 0.05, fetchOut = ['vtest'] } = {}) {
   const dir = fs.mkdtempSync(path.join('/tmp', 'lsbe-'));
   cleanups.push(() => fs.rmSync(dir, { recursive: true, force: true }));
   const out = path.join(dir, 'out');
@@ -62,7 +63,15 @@ function setup({ fetchRcs = [0], bridge = 'stay', agentScript = '', libFiles = t
   }
   fs.writeFileSync(path.join(bin, 'coder'), `#!/bin/bash\nenv > "${out}/agent-env"\n${agentScript}\n`, { mode: 0o755 });
   // sleep: records its argument and waits a moment, so a backoff of 60 s costs nothing
-  fs.writeFileSync(path.join(bin, 'sleep'), `#!/bin/bash\necho "$1" >> "${out}/sleeps"\nexec /bin/sleep 0.05\n`, { mode: 0o755 });
+  fs.writeFileSync(path.join(bin, 'sleep'), `#!/bin/bash\necho "$1" >> "${out}/sleeps"\nexec /bin/sleep ${sleepSecs}\n`, { mode: 0o755 });
+  // date: a fake clock for `date +%s` (real time plus the seconds in clock-offset); everything else is the real date
+  fs.writeFileSync(path.join(out, 'clock-offset'), '0');
+  fs.writeFileSync(
+    path.join(bin, 'date'),
+    `#!/bin/bash\nif [ "$1" = +%s ]; then echo $(( $(/bin/date +%s) + $(cat "${out}/clock-offset") )); else exec /bin/date "$@"; fi\n`,
+    { mode: 0o755 }
+  );
+  fs.writeFileSync(path.join(out, 'fetch-out'), `${fetchOut.join('\n')}\n`);
   // curl: stands in for the bridge's loopback /health. The file `health` holds the answer: a JSON body, `none` (no
   // answer, exit 7) or `500` (an HTTP error, exit 22 under -f).
   fs.writeFileSync(path.join(out, 'health'), '{"ok":true,"busy":false}');
@@ -87,12 +96,15 @@ case "$1" in
     rc="$(head -n1 "${out}/fetch-rcs")"
     if [ "$(wc -l < "${out}/fetch-rcs")" -gt 1 ]; then tail -n +2 "${out}/fetch-rcs" > "${out}/fetch-rcs.next"; mv "${out}/fetch-rcs.next" "${out}/fetch-rcs"; fi
     if [ "$rc" = block ]; then exec /bin/sleep 60; fi
-    [ "$rc" = 0 ] && echo vtest
+    if [ "$rc" = 0 ]; then
+      head -n1 "${out}/fetch-out"
+      if [ "$(wc -l < "${out}/fetch-out")" -gt 1 ]; then tail -n +2 "${out}/fetch-out" > "${out}/fetch-out.next"; mv "${out}/fetch-out.next" "${out}/fetch-out"; fi
+    fi
     exit "$rc" ;;
   *server.mjs)
     env > "${out}/bridge-env.$$"
     echo "$1" > "${out}/bridge-argv"
-    ${bridge === 'stay' ? 'exec /bin/sleep 60' : 'exit 3'} ;;
+    ${bridge === 'stay' ? 'exec /bin/sleep 60' : bridge === 'slow-exit' ? `echo $(( $(cat "${out}/clock-offset") + 61 )) > "${out}/clock-offset"; exit 3` : 'exit 3'} ;;
 esac
 `,
     { mode: 0o755 }
@@ -276,12 +288,41 @@ test('a fetcher configuration error (exit 2) stops the supervisor and does not r
   assert.strictEqual(JSON.parse(read(path.join(w.home, '.liivo', 'bridge', 'state.json'))).state, 'unavailable');
 });
 
-test('a bridge that exits is restarted with a backoff of 1, 2, 4, 8 s; the gateway is not asked again', async () => {
+test('a bridge that exits within 60 s is followed by a fetch after a backoff of 1, 2, 4, 8 s', async () => {
   const w = setup({ bridge: 'exit' });
-  await run(w);
+  const r = await run(w);
   await until(() => read(path.join(w.out, 'sleeps')).trim().split('\n').length >= 4, 'four restarts');
   assert.deepStrictEqual(read(path.join(w.out, 'sleeps')).trim().split('\n').slice(0, 4), ['1', '2', '4', '8']);
-  assert.strictEqual(read(path.join(w.out, 'fetch-runs')).trim().split('\n').length, 1, 'one fetch for all those runs');
+  await until(() => fetchRuns(w) >= 5, 'a fetch before each restart');
+  assert.match(r.log(), /bridge exited \(3\) within \d+s, fetching the current bridge/);
+  assert.doesNotMatch(r.log(), /restarting in/);
+});
+
+test('a bridge that ran 60 s or longer is restarted from the cache with no fetch and the wait resets to 1 s', async () => {
+  const w = setup({ bridge: 'slow-exit' });
+  const r = await run(w);
+  await until(() => bridgeStarts(w) >= 4, 'four bridge runs');
+  assert.deepStrictEqual(read(path.join(w.out, 'sleeps')).trim().split('\n').slice(0, 3), ['1', '1', '1']);
+  assert.strictEqual(fetchRuns(w), 1, 'one fetch at start only');
+  assert.match(r.log(), /bridge exited \(3\), restarting in 1s/);
+  assert.doesNotMatch(r.log(), /fetching the current bridge/);
+});
+
+test('a quick exit followed by a fetch with no verified bridge: state unavailable, no bridge process, 5 to 60 s retries, then it runs', async () => {
+  const w = setup({ bridge: 'exit', fetchRcs: [0, 3, 3, 0] });
+  await run(w);
+  await until(() => bridgeStarts(w) >= 1, 'the first bridge');
+  await until(() => stateOf(w).state === 'unavailable', 'state unavailable');
+  assert.strictEqual(bridgeStarts(w), 1, 'no new bridge process while there is no verified bridge');
+  await until(() => bridgeStarts(w) >= 2, 'the bridge after the fetch succeeds');
+  assert.deepStrictEqual(read(path.join(w.out, 'sleeps')).trim().split('\n').slice(0, 3), ['1', '5', '10']);
+});
+
+test('a quick exit followed by a fetch of a different version starts the new bridge', async () => {
+  const w = setup({ bridge: 'exit', fetchOut: ['vold', 'vnew'] });
+  await run(w);
+  await until(() => read(path.join(bridgeDir(w), 'running.json')).includes('vnew'), 'running.json to carry the new version');
+  assert.ok(bridgeStarts(w) >= 2);
 });
 
 test('the clone, the hooks and the agent are never delayed by the fetcher: the agent starts while the fetch is still blocked', async () => {
@@ -413,7 +454,8 @@ test('a request older than the bound is deleted without acting: bridge unchanged
 });
 
 test('a request written while the bridge is down (state starting) makes the next step a fetch, not a restart of the cached bridge', async () => {
-  const w = setup({ bridge: 'exit' });
+  // the bridge ran 61 s, so only the request can cause a fetch; the long restart wait holds the window open
+  const w = setup({ bridge: 'slow-exit', sleepSecs: 1 });
   await run(w);
   await until(() => bridgeStarts(w) >= 1, 'the first bridge run');
   fs.writeFileSync(requestFile(w), '');

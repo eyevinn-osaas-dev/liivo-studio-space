@@ -550,6 +550,36 @@ test('the signing socket is private and signs an aud git token only once the ten
   assert.ok(!auth.verifyToken(KEY, ok.body.token, 'browser', clock).ok);
 });
 
+function postSignerPath(socketPath, urlPath, method = 'POST') {
+  return new Promise((resolve, reject) => {
+    const req = http.request({ socketPath, path: urlPath, method }, (res) => {
+      const chunks = [];
+      res.on('data', (c) => chunks.push(c));
+      res.on('end', () => resolve({ status: res.statusCode, body: JSON.parse(Buffer.concat(chunks).toString()) }));
+    });
+    req.on('error', reject);
+    req.end();
+  });
+}
+
+test('/env-token signs only an aud env token with the git lifetime, the other routes keep their audience, auth.js refuses env', async () => {
+  await handoff(browserToken({ tenant: 'tenant', instance: 'tenant-proj', user: 'u1' }));
+  const env = await postSignerPath(signSocket, '/env-token');
+  assert.strictEqual(env.status, 200);
+  const claims = JSON.parse(Buffer.from(env.body.token.split('.')[1], 'base64url').toString());
+  assert.strictEqual(claims.aud, 'env');
+  const git = await postSignerPath(signSocket, '/git-token');
+  const gitClaims = JSON.parse(Buffer.from(git.body.token.split('.')[1], 'base64url').toString());
+  assert.strictEqual(gitClaims.aud, 'git');
+  assert.strictEqual(claims.exp, gitClaims.exp);
+  const bridge = await postSignerPath(signSocket, '/bridge-token');
+  assert.strictEqual(JSON.parse(Buffer.from(bridge.body.token.split('.')[1], 'base64url').toString()).aud, 'bridge');
+  // the forwarder itself refuses an env token for every audience it verifies
+  for (const aud of ['browser', 'gateway', 'git', 'env']) assert.ok(!auth.verifyToken(KEY, env.body.token, aud, clock).ok, aud);
+  assert.strictEqual(auth.AUDIENCES, undefined);
+  assert.strictEqual((await postSignerPath(signSocket, '/env-token', 'GET')).status, 404);
+});
+
 test('without a gateway URL the signer refuses', async () => {
   const s = createForwarder({ previewPort: 1, handoffKey: KEY, gatewayUrl: '', instance: 'i', now });
   const sock = path.join(tmp, 'nogw.sock');

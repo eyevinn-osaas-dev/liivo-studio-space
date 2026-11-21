@@ -1,0 +1,22 @@
+#!/bin/bash
+# liivo-env <command> [args]: runs the command with the project's parameter store values added to its
+# environment (Eyevinn/liivo-studio-space#21, docs/block.md). The values come from forwarder/liivo-env.js as
+# NUL-separated NAME=value records and are exported one by one: no value is passed to eval, source or a
+# shell for parsing. The wrapper then replaces itself with the command (exec: same pid, same exit status), so
+# a pid file written by a parent shell before the call still names the command. When the load fails or the
+# project has no store the command runs with the environment it was called with.
+if [ "$#" -eq 0 ]; then
+  echo "usage: liivo-env <command> [args]" >&2
+  exit 2
+fi
+lib="${LIIVO_LIB_DIR:-/usr/local/lib/liivo}"
+if [ ! -f "$lib/liivo-env.js" ]; then
+  lib="$(dirname "$(readlink -f "$0")")/forwarder"
+fi
+if command -v node >/dev/null 2>&1 && [ -f "$lib/liivo-env.js" ]; then
+  while IFS= read -r -d '' rec; do
+    export -- "$rec"
+  done < <(node "$lib/liivo-env.js" < /dev/null)
+fi
+unset lib rec
+exec "$@"

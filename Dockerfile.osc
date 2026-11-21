@@ -51,10 +51,12 @@ COPY --chmod=755 osc-entrypoint.sh /usr/local/bin/osc-entrypoint.sh
 # module, the git status reader and the git credential helper. Every file the
 # forwarder requires must be listed here. Uses the default Node from mise, which
 # the entrypoint has on PATH.
-COPY --chmod=644 forwarder/preview-forwarder.js forwarder/auth.js forwarder/workspace-status.js forwarder/git-credential-liivo.js forwarder/inject.js forwarder/bridge-fetch.js forwarder/default-start-status.js /usr/local/lib/liivo/
+COPY --chmod=644 forwarder/preview-forwarder.js forwarder/auth.js forwarder/workspace-status.js forwarder/git-credential-liivo.js forwarder/inject.js forwarder/bridge-fetch.js forwarder/default-start-status.js forwarder/liivo-env.js /usr/local/lib/liivo/
 # The default start for a repository without .liivo/start.sh (docs/block.md). Executable: the entrypoint
 # and the bridge's restart both run it as a program.
 COPY --chmod=755 default-start.js /usr/local/lib/liivo/
+# liivo-env: loads the project's parameter store values into a project process (docs/block.md).
+COPY --chmod=755 liivo-env /usr/local/bin/liivo-env
 # Git credentials for github.com come from the gateway through the edit proxy;
 # the helper prints nothing (git goes unauthenticated) when that fails.
 RUN git config --system 'credential.https://github.com.helper' '!node /usr/local/lib/liivo/git-credential-liivo.js'

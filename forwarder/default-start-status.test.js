@@ -58,8 +58,6 @@ test('no state file: the page is the one from before, with no status and no relo
 });
 
 for (const [state, reason, text, reloads] of [
-  ['installing', undefined, /Installing dependencies/, true],
-  ['starting', undefined, /Starting the dev server/, true],
   ['failed', 'install failed (exit 1)', /default start failed: install failed \(exit 1\)\. See \/tmp\/liivo-start-proj\.log/, false],
   ['none', 'no dev or start script in package.json', /Nothing to start: no dev or start script in package\.json.*\.liivo\/start\.sh/, false],
 ]) {
@@ -74,6 +72,40 @@ for (const [state, reason, text, reloads] of [
   });
 }
 
+for (const state of ['installing', 'starting']) {
+  test(`state ${state}: the friendly waiting page, centered with a spinner, reloading itself`, async () => {
+    const w = setup();
+    w.set({ state, reason: '<b>x</b>' });
+    const r = await page(w);
+    assert.strictEqual(r.status, 502);
+    assert.match(r.body, /<h1>Almost ready<\/h1><p>Finishing up the last pieces before your site is ready\.<\/p>/);
+    assert.match(r.body, /class="spinner" aria-hidden="true"/);
+    assert.match(r.body, /justify-content:center/);
+    assert.match(r.body, /<meta http-equiv="refresh" content="4">/);
+    assert.strictEqual(r.body.split('<script').length - 1, 1, 'exactly one chat tag');
+    assert.ok(!/Preview not running|Installing dependencies|Starting the dev server|<b>x/.test(r.body));
+  });
+}
+
+test('the waiting page has a Content-Length equal to its body', async () => {
+  const w = setup();
+  w.set({ state: 'installing' });
+  const fwd = createForwarder({ previewPort: 1, handoffKey: KEY, projectDir: w.project, startStateDir: w.stateDir });
+  await new Promise((r) => fwd.listen(0, '127.0.0.1', r));
+  cleanups.push(() => fwd.close());
+  const res = await new Promise((resolve, reject) => {
+    const req = http.request({ host: '127.0.0.1', port: fwd.address().port, path: '/', headers: { Cookie: COOKIE }, agent: false }, (x) => {
+      const chunks = [];
+      x.on('data', (c) => chunks.push(c));
+      x.on('end', () => resolve({ headers: x.headers, body: Buffer.concat(chunks) }));
+    });
+    req.on('error', reject);
+    req.end();
+  });
+  assert.strictEqual(res.headers['content-type'], 'text/html; charset=utf-8');
+  assert.strictEqual(Number(res.headers['content-length']), res.body.length);
+});
+
 test('state running adds nothing', async () => {
   const w = setup();
   w.set({ state: 'running' });
@@ -86,7 +118,7 @@ test('a state file that is not trusted gives the page from before', async () => 
     w.set(bad);
     const r = await page(w);
     if (bad.includes('xxxx')) continue; // over the size cap: checked below
-    assert.ok(!/default start|Nothing to start|Installing|Starting the dev/.test(r.body), bad);
+    assert.ok(!/default start|Nothing to start|Installing|Starting the dev|Almost ready|class="spinner"/.test(r.body), bad);
   }
   w.set(JSON.stringify({ state: 'failed', reason: 'x'.repeat(5000) }));
   assert.strictEqual(defaultStartStatus(w.project, w.stateDir), null, 'above the size cap');

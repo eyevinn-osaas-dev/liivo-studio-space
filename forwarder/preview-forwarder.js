@@ -48,9 +48,30 @@ const PAGE_401 =
   '<!doctype html><html><head><meta charset="utf-8"><title>Sign in required</title></head>' +
   '<body><h1>Sign in required</h1><p>Open this project from Liivo Studio.</p></body></html>\n';
 
+// Friendly page while the project sets itself up: centered, CSS-only spinner, no external asset, reloads itself.
+function pageWaiting() {
+  return (
+    '<!doctype html><html lang="en"><head><meta charset="utf-8">' +
+    '<meta name="viewport" content="width=device-width, initial-scale=1">' +
+    '<meta http-equiv="refresh" content="4"><title>Almost ready</title><style>' +
+    'body{margin:0;font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;color:#1f2937;background:#f9fafb}' +
+    '.wait{display:flex;flex-direction:column;align-items:center;justify-content:center;text-align:center;' +
+    'min-height:100vh;min-height:100dvh;padding:24px;box-sizing:border-box}' +
+    '.spinner{width:44px;height:44px;border:4px solid #e5e7eb;border-top-color:#6366f1;border-radius:50%;' +
+    'animation:spin 1s linear infinite;margin-bottom:24px}' +
+    'h1{font-size:1.5rem;font-weight:600;margin:0 0 8px}p{margin:0;color:#6b7280;max-width:28rem}' +
+    '@keyframes spin{to{transform:rotate(360deg)}}' +
+    '@media (prefers-reduced-motion:reduce){.spinner{animation:none}}' +
+    '</style></head><body><div class="wait"><div class="spinner" aria-hidden="true"></div>' +
+    '<h1>Almost ready</h1><p>Finishing up the last pieces before your site is ready.</p></div>' +
+    `${inject.tagFor('')}</body></html>\n`
+  );
+}
+
 // The page for a preview that does not answer. With a status of the default start (default-start.js) it adds one
 // status line and, while the default start is installing or starting, reloads itself.
 function page502(status = null) {
+  if (status && status.waiting) return pageWaiting();
   const refresh = status && status.refresh ? '<meta http-equiv="refresh" content="4">' : '';
   return (
     `<!doctype html><html><head><meta charset="utf-8">${refresh}<title>Preview not running</title></head>` +
@@ -644,6 +665,9 @@ function createForwarder({
     let audience = null;
     if (req.method === 'POST' && req.url === '/git-token') audience = ['git', 60];
     if (req.method === 'POST' && req.url === '/bridge-token') audience = ['bridge', BRIDGE_TOKEN_SECONDS];
+    // /env-token: liivo-env (audience env, 60 s like git), which loads the project's parameter store values.
+    // auth.js AUDIENCES is not widened: an env token is verified by the gateway only, never by this forwarder.
+    if (req.method === 'POST' && req.url === '/env-token') audience = ['env', 60];
     if (!audience) return refuse(404, 'not found');
     if (!handoffKey) return refuse(503, 'HANDOFF_KEY is not set');
     if (!gatewayUrl) return refuse(503, 'LIIVO_GATEWAY_URL is not set');
